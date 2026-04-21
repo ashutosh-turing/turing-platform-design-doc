@@ -27,7 +27,7 @@ Earlier drafts kept everything in one file. It hit 900 lines and the value-per-l
 |---|---|
 | `PLATFORM_DESIGN.md` (this doc) | Vision, zones, architecture, decisions, rollout |
 | `COMPONENT_ARCHITECTURE.md` | Per-component deep-dive with diagrams |
-| `CANVAS_SDK.md` | How canvases integrate — shell, bridge, manifest |
+| `CANVAS_SDK.md` | How canvases integrate — shell, bridge, registration (via IH) |
 | `EVENT_CATALOG.md` | Canonical events (reference) |
 | `IH_GAP_ANALYSIS.md` | Integration Hub current → target |
 
@@ -77,7 +77,7 @@ The code keeps `ExecutionSurface`; prose uses "canvas." Prior drafts used "selle
 
 **The payoff.** OpenClaw onboards in two weeks without writing platform code. TB and GDPVal re-home under the same contract. Finance consolidates on one event schema. Project #21 gets the nine hard-earned lessons from GDPVal and TB for free.
 
-**The ask.** P0 foundations in 6 weeks with 4 engineers delivers the seams (events, customer delivery, agent-panel integration, manifest registration). P1 in another 6 weeks delivers shared PPT primitives (pool, QC router, redispatch, admin, observability). P2 is nice-to-have trust and extensibility work.
+**The ask.** P0 foundations in 6 weeks with 4 engineers delivers the seams (events, customer delivery, agent-panel integration, IH as the integration plane for canvas + customer + platform-provider registration). P1 in another 6 weeks delivers shared PPT primitives (pool, QC router, redispatch, admin, observability). P2 is nice-to-have trust and extensibility work.
 
 **What this document is.** The design contract between AGI-OS platform engineering and every PPT canvas. It locks vision, zones, events, components, rollout, and governance so no new project gets to "just build it our way."
 
@@ -153,7 +153,7 @@ AGI-OS is:
 
 1. A **set of managed platform services** (identity, events, integration hub, user pool, QC, batching, HITL, notification, config, audit, admin, observability).
 2. An **SDK + CLI** that canvases use to call those services and emit canonical events.
-3. A **registry** of canvas manifests declaring which capabilities they use and at what level.
+3. The **Integration Hub as the single integration plane** — canonical home for canvas registration, customer integrations, and platform-provider integrations. Replaces anything that would otherwise live as a YAML manifest in a canvas repo.
 4. A **contract catalog** — the set of events, schemas, and invariants every canvas must honor.
 5. A **governance process** that evolves contracts without breaking canvases.
 
@@ -176,10 +176,10 @@ If you catch yourself designing something that requires the canvas to subclass a
 
 From AGI-OS's perspective, a canvas is a black box with four visible surfaces:
 
-1. **Identity** — every request the canvas makes is authenticated to a scoped tenant token.
+1. **Identity** — every request the canvas makes is authenticated to a scoped tenant token; identity is assigned and managed in Integration Hub.
 2. **Events emitted** — the canvas publishes canonical events at known lifecycle points.
 3. **Events consumed** — the canvas subscribes to canonical events and reacts (customer webhook acks, delivery confirmations).
-4. **Manifest** — a declaration of what the canvas is, what capabilities it uses, at what adoption level, and which events it emits and consumes.
+4. **IH registration record** — the authoritative record of the canvas: `canvas_id`, `slug`, `entry_url`, `backend_url`, owners, lifecycle state, capability grants. No YAML in the canvas's repo; the record lives in IH's database (`COMPONENT_ARCHITECTURE.md §4.3.4`).
 
 Everything else is invisible to the platform. That invisibility is the feature, not a limitation. It is what lets the platform serve 20 canvases without knowing what any of them actually builds.
 
@@ -203,12 +203,12 @@ flowchart TB
         QCMgmt["QC / Prism Console"]
         Financials["Financial Dashboards"]
         DLQUI["Operator DLQ / Replay"]
-        ManifestRegistry["Canvas Manifest Registry"]
+        IHAdmin["Integration Hub admin<br/>(canvas + customer + provider integrations)"]
     end
 
-    subgraph WorkerShell["Worker Shell<br/>(tasks.turing.com/ppt)<br/>public worker-facing"]
+    subgraph WorkerShell["Worker Shell<br/>(canvas-agi-os.turing.com)<br/>public worker-facing"]
         Chrome["Shell Chrome:<br/>nav · auth · notifications · profile · pay history"]
-        CanvasMount["/ppt/:canvas_id/*  →  mounted canvas"]
+        CanvasMount["/:canvas_id/*  →  mounted canvas"]
     end
 
     subgraph Canvases["Task Execution Canvases<br/>(one per PPT integration)"]
@@ -239,15 +239,15 @@ flowchart TB
 
 | Surface | Who | URL | Owns |
 |---|---|---|---|
-| **Admin Shell** | Operators, PMs, admins (Turing employees) | `agi-os.turing.com` (internal) | Project lifecycle, integration config, QC config, financials, DLQ replay, canvas registry browser |
-| **Worker Shell** | Workers (Turing contractors) | `tasks.turing.com/ppt` (public) | Chrome: left nav, auth, notifications, profile, pay history. Hosts canvases in its mount area. |
-| **Task Execution Canvas** | Workers (inside the worker shell) | `tasks.turing.com/ppt/:canvas_id/*` | The actual task UX — authoring, labeling, evaluating, submitting |
+| **Admin Shell** | Operators, PMs, admins (Turing employees) | `agi-os.turing.com` (internal) | Project lifecycle, Integration Hub (customer + canvas + platform-provider), QC config, financials, DLQ replay |
+| **Worker Shell** | Workers (Turing contractors) | `canvas-agi-os.turing.com` (public) | Chrome: left nav, auth, notifications, profile, pay history. Hosts canvases in its mount area. |
+| **Task Execution Canvas** | Workers (inside the worker shell) | `canvas-agi-os.turing.com/:canvas_id/*` | The actual task UX — authoring, labeling, evaluating, submitting |
 
 **Key properties.**
 
 1. **Operators never see canvases directly.** They configure projects in the admin shell, which configures IH and other services, which in turn render as options to workers.
 2. **Workers never see the admin shell.** The worker shell is their world. The canvas fills the content area; the shell provides everything around it.
-3. **Each canvas is a swap-in.** Replacing TB tomorrow is a manifest + deploy operation; the worker shell does not change.
+3. **Each canvas is a swap-in.** Replacing TB tomorrow is an IH lifecycle transition (deprecate TB, approve replacement) + a worker-shell route reload; the worker shell code itself does not change.
 4. **Admin and worker are two different products.** They share backend services but not UI code, not session state, not design system (they *may* share components; they need not).
 
 **Why this matters for design.** The admin shell is where `Integration Hub` configuration happens — that is, where an operator says "for project X, customer endpoint is Y, signing key is Z, pay model is `pay_per_task`." The worker shell is where the effect of that configuration is felt — a worker sees the TB canvas because project X was configured to use TB. The admin shell is the control plane; the worker shell (plus canvases) is the data plane made visible.
@@ -302,7 +302,7 @@ A canvas adopts a capability at one of three levels:
 | **1** | Override strategies | Use the reference implementation; inject custom strategies for specific behaviors (e.g. a custom eligibility policy on the pool). |
 | **2** | Replace implementation | Implement the contract yourself (e.g. run your own pool on Redis). Still emit canonical events. Still honor invariants. |
 
-Level 2 is allowed. **Forking is not.** The difference: Level 2 declares itself in the manifest and remains observable to the platform. A fork disappears into a canvas's private repo and becomes invisible.
+Level 2 is allowed. **Forking is not.** The difference: Level 2 is registered in IH with explicit capability grants and remains observable to the platform (it still emits canonical events). A fork disappears into a canvas's private repo and becomes invisible.
 
 ### 5.4 Platform ≠ in-process framework
 
@@ -367,7 +367,7 @@ Zone B is where the platform offers managed services that most canvases will use
 | Admin / Operator Console | Operator views; canvases may want custom panels. |
 | Observability & SLOs | Platform provides dashboards; canvases emit metrics. |
 
-The adoption level declared in the canvas's manifest tells the platform which Zone B services the canvas uses and at what level. Level 0 is the default; the platform reports on Level 1 / 2 adoption so deviations are visible.
+Capability grants configured in IH (§4.3.4 in `COMPONENT_ARCHITECTURE.md`) tell the platform which Zone B services the canvas uses and with what scope. Defaults are the starting point; the admin console reports on Level 1 / 2 adoption so deviations are visible.
 
 ### 6.3 Zone C — Canvas-owned (platform has no opinion)
 
@@ -393,7 +393,7 @@ Every known component, classified. (Details in `COMPONENT_ARCHITECTURE.md`.)
 | 1 | Canonical event catalog + envelope | A | `EVENT_CATALOG.md`, `COMPONENT_ARCHITECTURE.md §4.1` |
 | 2 | Event bus infrastructure | A | `COMPONENT_ARCHITECTURE.md §4.1` |
 | 3 | Identity, Tenancy & Access | A | `COMPONENT_ARCHITECTURE.md §4.2` |
-| 4 | Integration Hub — Outbound delivery | A | `COMPONENT_ARCHITECTURE.md §4.3`, `IH_GAP_ANALYSIS.md` |
+| 4 | Integration Hub (Integration Plane) — registration + outbound delivery | A | `COMPONENT_ARCHITECTURE.md §4.3`, `IH_GAP_ANALYSIS.md` |
 | 5 | Billing metering events | A | `COMPONENT_ARCHITECTURE.md §4.4` |
 | 6 | Audit Log | A | `COMPONENT_ARCHITECTURE.md §4.5` |
 | 7 | Secrets & Key Management | A | `COMPONENT_ARCHITECTURE.md §4.6` |
@@ -411,7 +411,7 @@ Every known component, classified. (Details in `COMPONENT_ARCHITECTURE.md`.)
 | 19 | Admin / Operator Console | B | `COMPONENT_ARCHITECTURE.md §5.11` |
 | 20 | Observability & SLOs | B | `COMPONENT_ARCHITECTURE.md §5.12` |
 | 21 | Canvas SDK + CLI | Rails | `CANVAS_SDK.md` |
-| 22 | Canvas Registry + Manifest | Rails | `CANVAS_SDK.md §3` |
+| 22 | Canvas Registration (via IH) | Rails | `CANVAS_SDK.md §3`, `COMPONENT_ARCHITECTURE.md §4.3.4` |
 | 23 | Sandbox / Staging | Rails | `COMPONENT_ARCHITECTURE.md §6.3` |
 | 24 | Authoring UI | C | — canvas-owned |
 | 25 | Task generator | C | — canvas-owned |
@@ -444,7 +444,7 @@ A canvas interacts with the platform across four distinct channels. None of them
 1. **SDK calls (outbound from canvas).** The canvas's services use the AGI-OS SDK to call platform services: allocate a task, claim a unit from a pool, submit a QC result, package a batch. Authenticated HTTP / gRPC calls scoped to the canvas's tenant.
 2. **Event emission (outbound from canvas).** At lifecycle transitions, the canvas publishes canonical events on the AGI-OS event bus. These events are the metering surface — finance, audit, customer delivery, and analytics all consume them.
 3. **Event consumption / webhooks (inbound to canvas).** The canvas subscribes to platform-emitted events or receives signed callbacks (e.g. "your outbound delivery was acked by the customer"). The canvas handles these idempotently.
-4. **Manifest registration (one-time, at deploy).** The canvas posts a `CanvasManifest` declaring its identity, events, capability adoption, and SLO claims. The platform validates and registers.
+4. **IH registration (one-time, operator-approved).** The canvas team submits a minimal registration request (display name, entry URL, backend URL, owners) through the IH admin console. On approval, IH assigns the `canvas_id`, issues bootstrap credentials, and grants capability scopes. No YAML in the canvas repo. See `COMPONENT_ARCHITECTURE.md §4.3.4`.
 
 The canvas never imports platform classes. The canvas never runs platform Python / Go / TypeScript inside its process. The canvas **calls**, **emits**, **subscribes**, **declares**. Nothing more.
 
@@ -454,7 +454,7 @@ AGI-OS separates concerns into three planes. Every platform service belongs to e
 
 | Plane | Purpose | Traffic | Examples | Consistency | Failure mode |
 |---|---|---|---|---|---|
-| **Control plane** | Configuration, registration, governance | Low-volume, high-consistency | Canvas Registry, Manifest validation, Config Service, Identity, Admin Console | Strong (Postgres) | Read-mostly caches keep runtime alive during a control-plane outage |
+| **Control plane** | Configuration, registration, governance | Low-volume, high-consistency | Integration Hub (all three integration shapes), Config Service, Identity, Admin Console | Strong (Postgres) | Read-mostly caches keep runtime alive during a control-plane outage |
 | **Data plane** | Task execution data, artifacts, submissions | Medium-volume, latency-sensitive | Task record store, User Pool, Artifact store (GCS), QC state | Strong per record; eventual across services | Backpressure; canvases queue until recovery |
 | **Event plane** | Cross-service communication, metering, audit | High-volume, bounded latency | Canonical event bus, outbound webhook dispatcher, audit log stream | At-least-once; consumers must be idempotent | DLQ, replay, backpressure |
 
@@ -473,7 +473,7 @@ flowchart LR
 
     subgraph External["External"]
         Cust[Customer systems]
-        Workers["Workers<br/>(tasks.turing.com/ppt)"]
+        Workers["Workers<br/>(canvas-agi-os.turing.com)"]
     end
 
     GW["Gateway<br/>(delivery-orchestration)<br/>JWT · internal headers · routing"]
@@ -625,6 +625,48 @@ Worth being explicit because architects tend to drift:
 
 ---
 
+### 7.8 Concurrency envelope & per-component SLOs
+
+The platform is designed for **50K – 1M registered workers / 200K peak concurrent**. That number is a design target, not an aspiration — every hot-path component in this document is sized against it.
+
+#### Design load
+
+| Metric | 200K concurrent (1M registered) |
+|---|---|
+| Claim QPS sustained | 330 |
+| Claim QPS peak (shift start) | 2.5K |
+| Heartbeat QPS | 6.7K |
+| Session JWT refresh QPS | 240 |
+| Active real-time sockets (SSE) | 200K |
+| Canonical events/s (all canvases, all flows) | 2.7K |
+| Capability `use` QPS (incl. heartbeat) | ~10K |
+
+Bursts at shift start, batch release, or project launch are 5–10× the sustained numbers. Every SLO below is stated against **peak burst, not mean**.
+
+#### Per-component SLOs
+
+| Component | SLO | Reference |
+|---|---|---|
+| Shell chrome static | CDN cache hit rate ≥ 99%; bootstrap payload ≤ 50 KB gzipped | — |
+| Gateway (`delivery-orchestration`) | p99 < 50 ms added overhead on capability RPC; 30K QPS sustained / 100K peak | `COMPONENT_ARCHITECTURE.md §4.8` |
+| Identity JWT refresh | p99 < 30 ms; 2K QPS sustained / 10K peak | — |
+| User Pool `claim` | p99 < 100 ms; 10K QPS sustained | `COMPONENT_ARCHITECTURE.md §5.1` (Scale / hot-path discipline) |
+| User Pool `heartbeat` | p99 < 10 ms; 50K QPS sustained | ditto |
+| Notification Edge end-to-end | bus → client p99 < 2 s; 200K concurrent sockets | `COMPONENT_ARCHITECTURE.md §4.9` |
+| IH slug resolution | p99 < 5 ms (cache hit); cache hit ≥ 99% | `COMPONENT_ARCHITECTURE.md §4.3.4` (Performance at scale) |
+| Hot bus (Redis Streams) | 100K ops/s per cluster; fan-out lag p99 < 500 ms | `§4.1` Layer 2 |
+| Audit Log durable write | 50K events/s sustained; query p99 < 1 s (90-day window) | `§4.5` |
+
+#### Stateful vs stateless tiers
+
+Only two tiers are stateful in the worker-facing path — **Notification Edge** (long-lived sockets) and **User Pool** (Redis hot-path + Postgres durable). Everything else is stateless behind a load balancer. This is a deliberate constraint: stateful-ness is expensive at 1M workers, so we pay for it only where real-time delivery or atomic claim demands it.
+
+#### What canvases inherit at Level 0
+
+Every number above is a commitment to canvases that accept defaults (Level 0). A canvas that needs more throughput than User Pool's `claim` SLO on a single pool should **shard its pool**, not step to Level 2. A canvas that needs different claim semantics moves to Level 2 and inherits its own performance envelope.
+
+---
+
 ## 8. Component catalog
 
 > **Moved.** The 19-component catalog (purpose, contract, events, SDK, storage, diagrams, tech choices per component) lives in `COMPONENT_ARCHITECTURE.md`.
@@ -635,7 +677,7 @@ Worth being explicit because architects tend to drift:
 
 ## 9. Cross-cutting rails
 
-> **Moved.** Canvas SDK, manifest, registry, and shell integration are specified in `CANVAS_SDK.md`. Sandbox/staging is a future addition to `COMPONENT_ARCHITECTURE.md §6.3`.
+> **Moved.** Canvas SDK, registration, and shell integration are specified in `CANVAS_SDK.md` (canvas-facing) and `COMPONENT_ARCHITECTURE.md §4.3.4` (platform-facing). Sandbox/staging is a future addition to `COMPONENT_ARCHITECTURE.md §6.3`.
 
 ---
 
@@ -732,11 +774,11 @@ Ship the Zone B components that make "onboard in two weeks" real.
 | Workstream | Deliverable |
 |---|---|
 | User Pool reference implementation | `COMPONENT_ARCHITECTURE.md §5.1` — pools, units, claims with `SKIP LOCKED`; stock strategies |
-| Canvas manifest + registry | `CANVAS_SDK.md §3` — declarative manifest, registration endpoint, validation |
+| Canvas registration via IH | `CANVAS_SDK.md §3` + `COMPONENT_ARCHITECTURE.md §4.3.4` — admin console form, approval flow, credential issuance, capability grants |
 | QC / Prism layered service | Wrap existing `quality-control` primitives into a managed service with canonical events |
 | Billing metering events | `COMPONENT_ARCHITECTURE.md §4.4` — four event families keyed by `pay_model` |
 | Canvas SDK v0 | Python SDK for `publish`, `subscribe`, `post`, `claim`, `heartbeat`, `release`, `register_outbound_endpoint` |
-| Worker shell v0 | `tasks.turing.com/ppt` chrome + canvas mount (architecture per `CANVAS_SDK.md §2` once decided) |
+| Worker shell v0 | `canvas-agi-os.turing.com` chrome + canvas mount (architecture per `CANVAS_SDK.md §2` once decided) |
 
 ### 14.3 P2 — Trust & extensibility (4 weeks)
 
@@ -759,22 +801,17 @@ Rollout is sequential by phase but can be parallelized within a phase.
 - Zone A contracts (event envelope, event types, identity model, IH outbound contract) follow **semver**.
 - **Minor** bumps add optional fields. Canvases do not need to change.
 - **Major** bumps remove or rename fields. **6-month deprecation window**; both versions supported simultaneously.
-- Deprecations announced in the `canvas-announce` channel + email + doc changelog + manifest registry banner.
+- Deprecations announced in the `canvas-announce` channel + email + doc changelog + IH admin console banner.
 
-### 15.2 Manifest validation
+### 15.2 Canvas registration (via Integration Hub)
 
-Every canvas submits a `CanvasManifest` declaring:
-- `canvas_id`, `version`, `trust` level
-- Capabilities used + adoption level (Level 0 / 1 / 2)
-- Events emitted + schema versions
-- Events consumed + minimum schema versions
-- SLO claims (p99 latency, availability)
+A canvas reaches production through Integration Hub's registration flow. See `CANVAS_SDK.md §3` (canvas-facing) and `COMPONENT_ARCHITECTURE.md §4.3.4` (platform-facing) for the full spec. Governance-relevant summary:
 
-Registration fails if:
-- Claimed events are not in `EVENT_CATALOG.md`.
-- Schema versions are not supported.
-- Level 2 adoption is claimed without required extension-point implementations declared.
-- SLO claims exceed platform-documented ceilings.
+- The registration record in IH is the authoritative source. There is no YAML manifest, no `canvas-registry` repo.
+- Canvas team provides ~8 fields (display name, entry URL, backend URL, owners, version). Everything else — `canvas_id`, capability scopes, credentials, lifecycle state — is platform-assigned on approval.
+- Capability adoption is **runtime discovery** (`capabilities.list` / `describe`), not a static declaration in a file. Authorization comes from the token's `scope` claim, which reflects the IH capability grants.
+- Events emitted by a canvas must be canonical (in `EVENT_CATALOG.md`) at valid schema versions. Enforcement is at the bus layer (emit-time validation), not at registration.
+- Lifecycle transitions (`staging → prod`, `prod → deprecated`, etc.) are operator-driven in IH, audited, and emit canonical events (`CanvasRegistered`, `CanvasPromoted`, `CanvasDeprecated`).
 
 ### 15.3 Breaking-change process
 
@@ -789,10 +826,11 @@ No canvas is surprised by a breaking change.
 ### 15.4 Canvas onboarding review
 
 A new canvas reaches production only after:
-- Manifest submitted + validated.
+- IH registration approved (lifecycle `staging` state).
 - Sandbox integration test passes (full task lifecycle with mock customer).
 - One-time architecture review with platform team (60 min).
 - Operator runbook merged.
+- Operator promotes lifecycle `staging → prod` in the IH admin console.
 
 This gate is cheap once the platform is mature. It exists to catch the 5% of issues that sandbox testing misses.
 
@@ -818,7 +856,7 @@ This gate is cheap once the platform is mature. It exists to catch the 5% of iss
 | 6 | Claim mode default — `Exclusive` or `SharedQuota`? | No — recommend `Exclusive`, confirm with TB + GDPVal | `COMPONENT_ARCHITECTURE.md §5.1` |
 | 7 | Billing event schemas per pay model | Yes | Billing team consumer design |
 | 8 | Observability — canvas-pushed metrics vs platform-pull from event stream | No — recommend platform-pull from events | `COMPONENT_ARCHITECTURE.md §5.12` |
-| 9 | Canvas versioning semantics — how does a manifest version relate to the canvas's internal deploy version? | Yes | Manifest registry |
+| 9 | Canvas versioning — one IH registration row per semver, or one row with version history? Affects capability-grant continuity on upgrades. | Yes | `COMPONENT_ARCHITECTURE.md §4.3.4` |
 | 10 | Non-Turing canvases allowed? | Strategic decision, not technical | Shell architecture (item 1) |
 
 ---
@@ -832,7 +870,7 @@ This gate is cheap once the platform is mature. It exists to catch the 5% of iss
 | **Canvas** / **TEC** | Task Execution Canvas — a PPT integration (TB, GDPVal, OpenClaw, …) hosted by AGI-OS |
 | **ExecutionSurface** | Code term for canvas; see `services/task-management/src/task_management/models/execution_surface.py` |
 | **Admin Shell** | AGI-OS UI at `agi-os.turing.com`, operator-facing |
-| **Worker Shell** | AGI-OS UI at `tasks.turing.com/ppt`, worker-facing |
+| **Worker Shell** | AGI-OS UI at `canvas-agi-os.turing.com`, worker-facing |
 | **Zone A / B / C** | Platform-dictated / platform-offered / canvas-owned |
 | **PPT** | Pay-per-task |
 | **Outbox pattern** | Write event row in the same DB transaction as business row; separate relay publishes to bus |

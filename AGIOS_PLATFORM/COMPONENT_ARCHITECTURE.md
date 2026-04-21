@@ -4,7 +4,91 @@
 
 ## Status
 
-**Draft v0.1.** Three components filled as a Pass 2 sample: [§4.1 Event Bus](#41-event-bus--canonical-catalog-zone-a), [§4.3 Integration Hub — Outbound](#43-integration-hub--outbound-delivery-zone-a), [§5.1 User Pool](#51-user-pool-zone-b). The remaining 16 are stubs with a one-line current-state note and fill out in Pass 2 continued.
+**Draft v0.3.** §0 Shell Offerings landing page + [§4.3 Integration Hub reframed as the Integration Plane](#43-integration-hub-integration-plane-zone-a) (three shapes: customer, canvas, platform-provider). Previously filled: [§4.1 Event Bus](#41-event-bus--canonical-catalog-zone-a), [§4.5 Audit Log](#45-audit-log-zone-a), [§5.1 User Pool](#51-user-pool-zone-b). Remaining sections are stubs with a current-state line; fill continues in Pass 3.
+
+## 0. Shell Offerings — what a canvas gets from the platform
+
+Before diving into internals, this is the **vendor-facing catalog** — what the platform actually offers a canvas team. Speaking it out loud matters, because otherwise every canvas rebuilds pool, QC, batching, HITL, and notification themselves. That is what we are refusing to let happen again.
+
+### 0.1 The six offerings
+
+| # | Offering | Shape | Who invokes | Why it exists |
+|---|---|---|---|---|
+| 1 | **Identity + sessions** | Platform-managed | Shell (for workers), Canvas backend (for service creds) | One auth story across all canvases; short-lived canvas-scoped tokens; operator visibility into sessions |
+| 2 | **Event bus + canonical catalog** | Platform-managed | Every canvas and service emits/subscribes | The seam between canvases and every cross-cutting concern (billing, audit, analytics, delivery) |
+| 3 | **User Pool** | Capability (RPC-shaped) | Canvas backend, canvas frontend (via bridge `capabilities.use`) | Atomic claim/lease/heartbeat; 80% of canvases don't need their own |
+| 4 | **QC / Prism** | Capability (RPC-shaped) | Canvas backend | Rubric execution, agent panels, scoring, redispatch — uniform across canvases |
+| 5 | **Integration Hub (Integration Plane)** | Capability (RPC + event pipeline) | Canvas backend (emit `TaskDelivered`), operators (register) | Single channel for customer delivery; single registration plane for canvases and platform integrations; no canvas does outbound itself |
+| 6 | **Worker-facing pipelines** — Batching, HITL, Notification | Capability (event pipeline-shaped) | Canvas backend (emit into), worker shell chrome (render) | Pipelines workers feel directly: batch packaging, reviewer flow, in-app / email / Slack notifications. Canvas does not build these. |
+
+Three supporting offerings (Zone A, non-optional, the canvas gets them whether it asks or not):
+
+| Offering | What it guarantees |
+|---|---|
+| **Audit Log** | Every event persisted 2y hot + 7y cold; compliance-queryable; replayable |
+| **Secrets & Key Management** | No secrets in canvas configs or DB rows; all via Secrets Service references |
+| **Artifact / Data Plane** | Uniform `ArtifactRef` for files; signed URLs on demand |
+
+### 0.2 How canvases consume them
+
+Two invocation shapes, depending on offering:
+
+```mermaid
+flowchart LR
+    subgraph Canvas["Canvas (backend + iframe)"]
+        CApp["Canvas app"]
+    end
+
+    subgraph RPC["RPC-shaped capabilities<br/>(User Pool, QC, IH Outbound, Artifact)"]
+        direction TB
+        Disc["capabilities.list<br/>capabilities.describe"]
+        Use["capabilities.use<br/>(method, args)"]
+    end
+
+    subgraph Pipeline["Event-pipeline-shaped capabilities<br/>(Batching, HITL, Notification, Audit)"]
+        direction TB
+        Emit["Canvas emits<br/>canonical event"]
+        React["Pipeline emits<br/>canonical event back"]
+    end
+
+    CApp --> Disc
+    Disc --> Use
+    CApp --> Emit
+    Emit --> React
+    React --> CApp
+```
+
+- **RPC-shaped** — canvas asks, platform responds. Method + args. Examples: `user_pool.claim`, `qc.evaluate`, `ih_outbound.register_endpoint`. Discovered via `capabilities.list` (§4.5 in `CANVAS_SDK.md`).
+- **Event-pipeline-shaped** — canvas emits into, pipeline produces output events. Examples: canvas emits `TaskSubmitted` → batching service produces `BatchSealed`; canvas emits `TaskNeedsReview` → HITL service produces `ReviewCompleted`.
+
+Why split? RPC is for synchronous "give me an answer now" — claim a unit, submit a rubric. Event pipelines are for "run this through a process and tell me when done" — batch, review, notify. Forcing either shape onto the other makes the API awkward.
+
+### 0.3 What the platform deliberately does NOT offer
+
+Saying this explicitly saves every canvas from asking:
+
+- **Task workflow orchestration.** Canvases own their task lifecycle. Temporal, Cloud Tasks, Celery, cron — your choice.
+- **Task UI components.** No shared design system imposed. Shell chrome is shell-owned; the iframe interior is yours.
+- **Customer contracts.** Platform ships canonical events; pay model + billing event shaping is a separate contract (see `PLATFORM_DESIGN §8`).
+- **Worker recruitment / payouts.** Talent and flex platforms own those. Platform emits the events that let them bill.
+
+### 0.4 Offering ↔ component map
+
+| Offering | Section | Zone | Status |
+|---|---|---|---|
+| Identity + sessions | §4.2 | A | partial |
+| Event bus + catalog | §4.1 | A | in-development |
+| Integration Hub (registration + outbound + inbound) | §4.3, §5.8 | A + B | in-development / not-implemented |
+| User Pool | §5.1 | B | planned |
+| QC / Prism | §5.3 | B | partial |
+| Batching | §5.4 | B | not-implemented |
+| HITL | §5.5 | B | not-implemented |
+| Notification (internal) | §5.6 | B | partial |
+| Audit Log | §4.5 | A | not-implemented |
+| Secrets | §4.6 | A | partial |
+| Artifact | §4.7 | A | partial |
+
+---
 
 ## How to read this document
 
@@ -37,11 +121,13 @@ For Integration Hub components only, an additional field — **Current state vs 
 |---|---|---|---|
 | 4.1 | Event Bus + canonical catalog | A | in-development |
 | 4.2 | Identity, Tenancy & Access | A | partial |
-| 4.3 | Integration Hub — Outbound delivery | A | not-implemented |
+| 4.3 | Integration Hub (Integration Plane) — registration + outbound delivery | A | in-development |
 | 4.4 | Billing metering contract | A | not-implemented |
 | 4.5 | Audit Log | A | not-implemented |
 | 4.6 | Secrets & Key Management | A | partial |
 | 4.7 | Artifact / Data Plane | A | partial |
+| 4.8 | Gateway / API Edge | A | partial |
+| 4.9 | Notification Edge | A | not-implemented |
 | 5.1 | User Pool | B | planned |
 | 5.2 | Task Execution + State Machine | B | partial |
 | 5.3 | QC / Prism | B | partial |
@@ -277,15 +363,48 @@ Not applicable. The bus is Zone A and non-optional. Every canvas uses it.
 
 ---
 
-### 4.3 Integration Hub — Outbound delivery (Zone A)
+### 4.3 Integration Hub (Integration Plane) (Zone A)
 
-**Purpose.** The **single channel** through which a canvas's task results reach a customer. The dispatcher subscribes to canonical `TaskDelivered` events, signs an outbound request, delivers it to the customer's endpoint with retries and DLQ, and emits `TaskDeliveryAcked` on success (or `WebhookDeliveryFailed` on exhaustion).
+**Purpose.** Integration Hub is the **single registration + operation plane** for every external system the platform talks to. One service, one data model, one audit surface, one RBAC model, three integration shapes.
 
-The restriction is absolute: **no canvas delivers to a customer except through this dispatcher.** That is what makes customer trust, signing, retry, and audit uniform across 20+ canvases. It is the single most important Zone A component in this catalog.
+Without this consolidation, every new integration type grows its own config table, its own admin CRUD, its own secrets handling, its own audit log. That was the trap we were walking into with a separate `canvas-manifest.yaml` + a separate `ConnectorConfigModel` + a planned separate `platform_providers` table. All three are the same shape with different payloads.
 
-**Zone + status.** Zone A. `not-implemented`. See [current state](#43-current-state).
+**Zone + status.** Zone A. `in-development` for customer integrations (inbound + outbound). `not-implemented` for canvas registration. `not-implemented` for platform-provider registration.
 
-#### Dispatcher flow
+#### 4.3.0 The three integration shapes
+
+Every row in IH is one of these:
+
+| Shape | Purpose | Examples | Direction |
+|---|---|---|---|
+| **Customer integration** | Customer systems that send us work or receive our results | Salesforce (inbound opp data), Google Sheets (ingest), Jira (ticket fulfillment), Anthropic webhook (delivery) | Inbound + outbound |
+| **Canvas integration** | Task Execution Canvases mounted in the worker shell | TB, GDPVal, OpenClaw | Canvas → platform (API calls + events), platform → canvas (bridge messages) |
+| **Platform-provider integration** | External services the platform itself uses | GCS (artifact store), Keyhive (LLM keys), Secrets Manager (credentials), Jibble (time tracking for `hourly` pay) | Platform → provider |
+
+All three share:
+
+- **Data model** — `dos_ih_integrations` parent table, per-shape subtype tables, shared audit log, shared RBAC.
+- **Admin UI** — same list/detail/credentials/audit views; shape-specific fields are rendered from the subtype table.
+- **Credential flow** — issued on approval, stored in Secrets Service, delivered once, rotatable.
+- **Lifecycle** — `pending → staging → prod → deprecated → archived`, audited.
+- **Event emission** — every state transition produces a canonical event (`CustomerIntegrationRegistered`, `CanvasRegistered`, `CanvasPromoted`, `ProviderIntegrationRotated`, ...).
+
+#### 4.3.1 Why one service, not three
+
+The temptation is "customer integrations feel different from canvases, split them." We don't, because:
+
+1. **The operational surface is identical.** Register → approve → credentials → staging → prod → deprecate. Every shape walks this loop.
+2. **Credentials management is the hardest part.** Splitting three ways means three Secrets Service integrations, three rotation policies, three audit paths. One is enough pain.
+3. **Cross-shape queries matter.** "Which canvases deliver to which customers?" and "Which platform providers does each canvas depend on?" are real operator questions. Three services, three joins.
+4. **The outbound dispatcher doesn't care what's on the other end.** It takes `endpoint_id`, resolves config, signs, delivers. Whether that endpoint is a customer or a canvas's own webhook doesn't matter — same code path.
+
+#### 4.3.2 Outbound delivery (customer integrations)
+
+This is the most-discussed responsibility of IH, and the one already fleshed out in §8.3 of `PLATFORM_DESIGN.md`. The **single channel** through which a canvas's task results reach a customer. The dispatcher subscribes to canonical `TaskDelivered` events, signs an outbound request, delivers to the customer's endpoint with retries and DLQ, and emits `TaskDeliveryAcked` on success (or `WebhookDeliveryFailed` on exhaustion).
+
+The restriction is absolute: **no canvas delivers to a customer except through this dispatcher.**
+
+##### Dispatcher flow
 
 ```mermaid
 sequenceDiagram
@@ -444,7 +563,7 @@ async def register_outbound_endpoint(
 | Secret rotation mid-flight | In-flight attempts complete with old secret; new attempts use new secret |
 | Platform DLQ full | Rate-limit `TaskDelivered` subscription; ops alert |
 
-#### 4.3.1 Relationship to project creation
+#### 4.3.3 Customer integrations — relationship to project creation
 
 The project-creation wizard is the **control-plane surface** that materializes outbound endpoints. Understanding this matters because the wizard is the only user-facing surface that configures IH today.
 
@@ -457,19 +576,145 @@ The wizard's "Integrations" sidebar wires into IH like this:
 
 The outbound dispatcher is entirely reactive: it reads `dos_ih_outbound_endpoints` and acts on `TaskDelivered` events.
 
+#### 4.3.4 Canvas integrations
+
+A canvas registration is an IH integration with shape `canvas`. See `CANVAS_SDK.md §3` for the canvas-team-facing summary; this section is the component-architecture view.
+
+##### Data model
+
+```mermaid
+erDiagram
+    dos_ih_integrations ||--|| dos_ih_canvas_integrations : "subtype"
+    dos_ih_integrations ||--o{ dos_ih_integration_audit : "audited by"
+    dos_ih_canvas_integrations ||--o{ dos_ih_canvas_capability_grants : "granted"
+
+    dos_ih_integrations {
+        uuid id PK
+        enum shape "customer | canvas | platform_provider"
+        enum lifecycle "pending | staging | prod | deprecated | archived"
+        string display_name
+        jsonb owners
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    dos_ih_canvas_integrations {
+        uuid integration_id PK_FK
+        string canvas_id "cvs_* nonce, immutable"
+        string slug "URL segment, unique"
+        string version
+        string entry_url
+        string backend_url
+        string health_path
+        string client_id
+        string client_secret_ref "Secrets Service ref"
+    }
+
+    dos_ih_canvas_capability_grants {
+        uuid id PK
+        uuid integration_id FK
+        string capability "user_pool | qc | ih_outbound | ..."
+        jsonb scope_list "[user_pool:claim, user_pool:heartbeat, ...]"
+        timestamp granted_at
+        string granted_by
+    }
+
+    dos_ih_integration_audit {
+        uuid id PK
+        uuid integration_id FK
+        string actor
+        enum action "created | approved | promoted | deprecated | credential_rotated | scope_granted | scope_revoked"
+        jsonb before
+        jsonb after
+        timestamp at
+    }
+```
+
+##### Contract
+
+1. `canvas_id` is platform-assigned on approval (`cvs_<nonce>`), immutable, never reused. The canvas team does not choose it.
+2. `slug` is unique within the environment. Changing a slug is a lifecycle event, audited, triggers worker-shell route map reload.
+3. `client_secret` is stored in the Secrets Service; only a reference lives in the DB row.
+4. Capability grants are the authoritative source for what the canvas's session JWT `scope` claim carries. A grant revoke takes effect on next token mint (15 min max lag).
+5. Every lifecycle transition emits a canonical event (`CanvasRegistered`, `CanvasPromoted`, `CanvasDeprecated`, `CanvasArchived`, `CanvasCredentialRotated`, `CanvasScopeChanged`).
+
+##### Events emitted
+
+| Event | When |
+|---|---|
+| `CanvasRegistered` | Operator approved a new canvas; lifecycle `pending → staging` |
+| `CanvasPromoted` | `staging → prod` |
+| `CanvasDeprecated` | `prod → deprecated` |
+| `CanvasArchived` | Any → `archived` |
+| `CanvasCredentialRotated` | Secret rotated (planned or on demand) |
+| `CanvasScopeChanged` | Capability grant added / revoked |
+
+Consumers: audit log (always), worker shell (to refresh its canvas directory), observability (dashboards).
+
+##### Admin operations
+
+Operator actions (all audited):
+
+- Approve / reject registration requests
+- Promote / deprecate / archive
+- Rotate credentials (on schedule or on demand)
+- Grant / revoke capability scopes
+- Update `entry_url` or `backend_url` (requires re-approval)
+
+##### Performance at scale
+
+The canvas directory is on the worker-shell hot path: every iframe load resolves `slug → canvas_id + entry_url + capability grants`. At 200K concurrent workers with one navigation per minute this is ~3.3K QPS. IH's Postgres read path is not the right tier for this.
+
+**Caching rules:**
+
+1. **Shell pod LRU** — in-memory cache keyed by `slug`, holds ~500 canvases, TTL 5 min. Sub-millisecond on hit.
+2. **Redis cache** — second level keyed by `slug`, TTL 5 min, shared across shell pods.
+3. **Invalidation via the bus** — IH emits `CanvasRegistered`, `CanvasPromoted`, `CanvasDeprecated`, `CanvasArchived`, `CanvasCredentialRotated`, `CanvasScopeChanged`. The worker shell subscribes and invalidates the matching `slug` entries on both tiers.
+4. **Capability grants** are cached on the same key. A `CanvasScopeChanged` event triggers re-fetch on next miss; existing session JWTs continue until expiry (max 15 min lag) because scope lives in the token claim.
+
+At this point IH's own Postgres sees only cache misses and invalidation-triggered refetches — bounded at tens of QPS regardless of worker count.
+
+#### 4.3.5 Platform-provider integrations
+
+External services the platform depends on. Examples: GCS (artifact storage), Keyhive (LLM key management, GDPVal-specific today), GCP Secret Manager, Salesforce (inbound data source for customer integrations), Jibble (time tracking for `hourly` pay).
+
+##### Why they live in IH
+
+Every platform-provider integration has the same operational needs as customer and canvas integrations: registration, credentials in Secrets Service, rotation, audit, lifecycle. Keeping a separate `platform_providers` table means duplicating all of that. Subtype table on the same parent pays once.
+
+##### Data model
+
+```
+dos_ih_platform_provider_integrations (
+  integration_id PK_FK,
+  provider_type   enum(gcs | keyhive | secret_manager | salesforce | jibble | ...),
+  connection_config jsonb,          -- provider-specific non-secret config
+  credential_ref   string           -- Secrets Service reference
+)
+```
+
+##### Contract
+
+1. Platform-provider integrations are **operator-managed**, not canvas-requested. No canvas PR flow, no canvas approval loop.
+2. A canvas cannot directly address a platform-provider integration — it asks a capability (e.g. `artifact.sign_url`), and the capability routes to the configured provider. Swapping providers is a capability-config change, not a canvas change.
+3. Rotation is the default path; manual rotation is always available.
+
 <a id="43-current-state"></a>
 #### Current state vs target
 
-See `IH_GAP_ANALYSIS.md §4` for the full gap table. Summary:
+See `IH_GAP_ANALYSIS.md` for the full gap table. Summary:
 
-- IH today handles **inbound only**. No outbound path exists — no endpoint model, no dispatcher, no subscription to `TaskDelivered`, no DLQ.
+- IH today handles **customer inbound only**. No outbound path. No canvas shape. No platform-provider shape.
 - `TaskDelivered` event type does not yet exist in `shared/events/types.py`.
-- `ProjectIntegration` (in `project-management`) duplicates `ConnectorConfigModel` (in `integration-hub`) — real design bug, resolution in `IH_GAP_ANALYSIS.md`.
+- `ProjectIntegration` (in `project-management`) duplicates `ConnectorConfigModel` (in `integration-hub`) — real design bug; resolution: IH's subtype tables are the source of truth, PM reads via IH SDK.
+- Canvas registration currently has no home. Proposed resolution: IH canvas shape (§4.3.4).
+- Platform-provider credentials are scattered (`webhook_secret` plaintext in DB rows, LLM keys in Keyhive only for GDPVal). Proposed: IH platform-provider shape with Secrets Service integration (§4.3.5).
 
 #### Owner + open decisions
 
 - **Owner.** Integration Hub team.
-- **Open decision.** None at contract level. Implementation sequence is tracked in `IH_GAP_ANALYSIS.md §5`.
+- **Open decision.** Subtype-table vs single-table-inheritance for the three shapes. Leaning subtype (cleaner shape-specific indexes, harder to accidentally leak canvas data onto a customer view). ADR before implementing §4.3.4.
+- **Open decision.** Canvas registration request UX — self-serve form vs ticket + manual entry for first 3 canvases, then open up. Leaning manual for the first 3 (TB, GDPVal, OpenClaw), self-serve after.
 
 ---
 
@@ -626,6 +871,149 @@ Not applicable. Zone A, non-optional. Every event from every canvas lands here.
 
 ---
 
+### 4.8 Gateway / API Edge (Zone A)
+
+**Purpose.** The single HTTP entry point for every canvas call into the platform — capability RPCs (`capabilities.use`), auth handoff, event emit endpoints, admin APIs. Today's `delivery-orchestration` service. At 1M workers the gateway is a shared resource for tens of thousands of QPS; its hot-path discipline is the difference between linear-scale and a cliff.
+
+**Zone + status.** Zone A. `partial`. Gateway exists today; hot-path discipline needs to be explicit.
+
+#### Hot-path discipline (non-negotiable)
+
+1. **Strictly stateless.** No per-request DB reads. Project lookups, canvas lookups, and tenancy checks resolve through the token claim or through cached reference data (see §4.3.4 Performance at scale).
+2. **Auth is token-native.** The session JWT (§5.2 of `CANVAS_SDK.md`) carries `scope`, `canvas_id`, `project_id`, `worker_id`. Gateway trusts the token signature (JWKS cache) and never re-derives authorization from the DB on a hot-path call.
+3. **Audit writes are async.** Every capability invocation emits `CapabilityInvoked` to the outbox; the gateway returns without waiting for audit-log persistence. Audit Log service (§4.5) drains the outbox.
+4. **Connection pooling + circuit breakers.** One pool per downstream capability service, with a per-service circuit breaker. A slow capability does not take down the gateway.
+5. **Per-worker rate limiting.** Redis token bucket keyed by `worker_id`, enforced at the edge. Caps a runaway canvas at (e.g.) 50 req/s per worker. Rejection returns `429` with `Retry-After` and emits `RateLimitExceeded`.
+6. **No business logic.** The gateway routes, authenticates, and meters. Every other concern lives in a downstream service.
+
+#### Contract
+
+- Routing is by `capability` string and `method` name (for `capabilities.use`), or by explicit path (for event emit, admin).
+- Every request carries a `correlation_id` header; if absent, gateway generates one. All downstream services propagate it.
+- 4xx vs 5xx is strict: 4xx means canvas did something wrong (fix the caller), 5xx means platform did something wrong (page the platform oncall).
+
+#### Events emitted
+
+| Event | When |
+|---|---|
+| `CapabilityInvoked` | Every `capabilities.use` call (async, via outbox) |
+| `RateLimitExceeded` | Per-worker rate limit tripped |
+| `GatewayCircuitOpen` | A downstream capability circuit opened |
+
+#### Storage ownership
+
+None direct. Gateway reads the JWKS cache (populated from Identity) and the capability routing table (populated from IH + service registry).
+
+#### Failure modes
+
+| Failure | Response |
+|---|---|
+| Downstream capability slow | Circuit breaker opens; gateway returns `503` with `Retry-After`; `GatewayCircuitOpen` emitted |
+| Downstream capability down | Same as above plus alert; canvas handles per its own retry policy |
+| JWKS fetch fails | Gateway falls back to last-known good JWKS (TTL 1 h); new tokens rejected with `unauthorized` if JWKS is stale beyond TTL |
+| Per-worker flood | 429 + event; operator console surfaces flooding canvases |
+
+#### Owner + open decisions
+
+- **Owner.** AGI-OS platform team.
+- **Open decision.** Whether to keep `delivery-orchestration` as the single gateway or split admin/operator APIs onto a separate edge. Leaning single gateway with a path prefix (`/admin/*` vs `/canvas/*`) to keep ops simple.
+
+---
+
+### 4.9 Notification Edge (Zone A)
+
+**Purpose.** Terminate worker-facing real-time connections (SSE today, WebSocket or FCM/APNS tomorrow), subscribe to the canonical event bus, fan out relevant events to connected workers, and provide a store-and-deliver buffer for disconnected workers. This is the tier that turns canonical events into "the annotator sees a new task appear without refreshing."
+
+**Zone + status.** Zone A. `not-implemented`. The Zone B §5.6 (Notification — internal) is the capability API canvases emit into; §4.9 is the tier that delivers to the worker. Two different concerns.
+
+#### Why this is its own tier
+
+At 200K concurrent workers a single pod holds ~25K SSE connections before GC pressure kicks in. Notification edge is fundamentally stateful (one long-lived socket per worker) and must be deployed separately from the stateless `worker-experience-service`. Co-locating them means the stateless chrome API tier inherits the stateful pod lifecycle (sticky routing, drain-on-deploy) for no reason.
+
+#### Topology
+
+```mermaid
+flowchart LR
+    W1[Worker 1] -.SSE.-> NE1[notification-edge pod 1]
+    W2[Worker 2] -.SSE.-> NE1
+    W3[Worker 3] -.SSE.-> NE2[notification-edge pod 2]
+    WN[Worker N] -.SSE.-> NEM[notification-edge pod M]
+
+    LB[LB<br/>hash worker_id] --> NE1
+    LB --> NE2
+    LB --> NEM
+
+    BUS[[Redis Streams<br/>hot bus]] --> NE1
+    BUS --> NE2
+    BUS --> NEM
+
+    NE1 --> PG[(Postgres<br/>store-and-deliver<br/>dos_ne_pending)]
+    NE2 --> PG
+    NEM --> PG
+
+    FCM[FCM / APNS<br/>mobile / idle workers]
+    NE1 -.fallback.-> FCM
+```
+
+- Sticky routing via LB hash on `worker_id` so reconnects land on the pod that already holds the subscription state.
+- Each pod subscribes to the hot bus with a consumer-group filter; in-memory map `worker_id → [topic filters]` decides which events forward to which socket.
+- Pods are stateless with respect to storage — presence is derived from the socket list; disconnection triggers a store-to-Postgres write (unread queue, bounded).
+- Mobile / idle workers (no open socket for > 5 min) fall back to FCM/APNS push.
+
+#### Contract
+
+1. Once a canvas emits into the Notification (Zone B) capability, delivery to online workers is **at-least-once within 2 s p99**.
+2. Offline delivery is **at-least-once within 24 h**; unread queue is bounded at 1000 entries per worker (oldest dropped with `NotificationQueueOverflow` event).
+3. Reconnection drains the unread queue before resuming live stream. Client acks each delivery.
+4. Multi-device: one worker can have multiple active sockets (e.g. two browser tabs); fan-out to all.
+
+#### Events emitted
+
+| Event | When |
+|---|---|
+| `NotificationDelivered` | Push acked by client |
+| `NotificationQueuedForOffline` | Worker disconnected; message went to the unread queue |
+| `NotificationQueueOverflow` | Unread queue for a worker exceeded 1000; oldest dropped |
+
+#### Events consumed
+
+Anything the notification-emitting capability (§5.6) routes to it. Routing rules are per-topic and per-subscription; canvases subscribe workers to topics at task-claim time.
+
+#### Storage ownership
+
+- `dos_ne_pending (worker_id, notification_id, payload, enqueued_at, expires_at)` — unread queue. TTL-based cleanup.
+- `dos_ne_subscriptions (worker_id, canvas_id, topic, expires_at)` — per-worker topic filters. Populated by capability calls.
+
+Redis for presence (`ne:presence:<worker_id>` with socket-pod mapping); Postgres for the durable queue.
+
+#### Scale envelope
+
+| Metric | Target |
+|---|---|
+| Concurrent sockets per pod | 25K (measured ceiling; revisit if frameworks change) |
+| End-to-end latency bus → client p99 | 2 s |
+| Fan-out throughput per pod | 5K msgs/s |
+| Unread queue write rate | 10K/s sustained |
+
+200K concurrent → 8 pods steady-state, provision 12 for headroom. 1M concurrent → 40 pods, provision 60.
+
+#### Failure modes
+
+| Failure | Response |
+|---|---|
+| Pod crash | Clients reconnect; LB hashes to the same pod type; unread queue in Postgres catches anything missed |
+| Hot bus lag | Notification delivery lags proportionally; surfaced via dashboard; no data loss |
+| Client flapping (reconnect storm) | Exponential backoff client-side + per-worker connection-rate cap at the LB |
+| Worker muted (> 24 h) | Queue TTL expires; older notifications dropped; emitter can query unread count via API |
+
+#### Owner + open decisions
+
+- **Owner.** AGI-OS platform team (new service).
+- **Open decision.** SSE vs WebSocket for v1. Leaning SSE — one-way, simpler, works with HTTP/2 multiplexing, no framing overhead for our use case. WebSocket opens up bi-directional but we don't need it in v1.
+- **Open decision.** Whether to build our own edge or put Cloud Pub/Sub + an off-the-shelf push service in front. Leaning build-our-own because the subscription-filter logic is canvas-specific and wedding it to a generic push provider adds indirection with no benefit. Revisit if ops load shows otherwise.
+
+---
+
 ## 5. Zone B components
 
 ### 5.1 User Pool (Zone B)
@@ -756,10 +1144,38 @@ Canvases at Level 1 declare one or more of these overrides in their manifest. St
 | Pool exhaustion | Canvas's `TaskCreated` rate exceeds pool throughput; SDK surfaces a queue-depth warning via metrics; ops dashboards red on sustained depth |
 | Worker fraud (claim-and-drop cycle) | `WatchedUserThrottle` caps rapid release cycles per worker; audit events emitted; ops alert |
 
+#### Scale / hot-path discipline
+
+The reference implementation is the one every Level-0 canvas inherits. It must hold at 1M registered workers / 200K concurrent without forcing canvases up to Level 2. Two call volumes dominate:
+
+- **Claim.** ~330 QPS sustained, ~2.5K QPS at shift start.
+- **Heartbeat.** ~6.7K QPS steady (30 s cadence × 200K concurrent).
+
+Postgres `SKIP LOCKED` handles the claim rate comfortably when `dos_up_units` is partitioned by `pool_id` and indexed on `(status, eligibility_hash, claim_strategy_key)`. Heartbeats, however, would saturate Postgres — they must not touch it.
+
+**Hot-path rules:**
+
+1. **Claim path** — Postgres `SELECT … FOR UPDATE SKIP LOCKED` on a pool-sharded table. Write-through to a Redis claim record (`claim:<claim_id>` with TTL = lease duration) for the heartbeat path to refresh.
+2. **Heartbeat path** — Redis `EXPIRE claim:<claim_id> <new_ttl>`. Zero Postgres touch. A background reconciler drains expired Redis keys into `UnitExpired` events and flushes lease state back to Postgres.
+3. **Release / complete** — Dual-write: Redis delete + Postgres state update in the same service call, Redis first. A lost Postgres write is recovered by the reconciler using the Redis-absence signal.
+4. **Pool shard fan-out** — Large pools (> 100K posted units) shard by a configurable bucket key: `pool:<pool_id>:shard:{0..31}`. Dispatcher rotates workers across shards to avoid hot-key contention. Default bucket count is 16; tune per-pool.
+5. **Eligibility check** — Evaluated inside the claim query via a materialized `eligibility_hash` column; complex policies are resolved async on unit post, not on claim. Claim-time eligibility is always a hash comparison.
+
+**Committed SLOs (reference implementation, Level 0):**
+
+| Operation | p50 | p99 | Sustained throughput |
+|---|---|---|---|
+| `claim` | 20 ms | 100 ms | 10K QPS |
+| `heartbeat` | 2 ms | 10 ms | 50K QPS |
+| `release` / `complete` | 15 ms | 80 ms | 5K QPS |
+
+These are the numbers Level-0 canvases can plan around. A canvas that needs more throughput than this for a single pool should shard its pool; a canvas that needs different claim semantics moves to Level 2.
+
 #### Owner + open decisions
 
 - **Owner.** AGI-OS platform team.
 - **Open decision.** Default `ClaimMode` is `Exclusive`. Shared-quota is opt-in per pool. Confirm with first two canvases (TB, GDPVal) that this matches their expectation before locking the default.
+- **Open decision.** Pool-shard default bucket count. 16 feels right for pools up to ~500K units; revisit if OpenClaw or xAI routing pushes higher.
 
 ---
 
@@ -853,7 +1269,7 @@ Canvases at Level 1 declare one or more of these overrides in their manifest. St
 >
 > **Current state.** SQLAdmin-based views in `services/integration-hub/src/integration_hub/admin/` for connector config + webhook events.
 >
-> **Target.** First-class operator console: project creation (already live in frontend), outbound endpoint management, DLQ replay UI, payouts view, dispute workflow, canvas manifest registry browser.
+> **Target.** First-class operator console: project creation (already live in frontend), IH integration registry (customer + canvas + platform-provider), outbound endpoint management, DLQ replay UI, payouts view, dispute workflow.
 
 ---
 
@@ -870,8 +1286,8 @@ Canvases at Level 1 declare one or more of these overrides in their manifest. St
 ### 6.1 Canvas SDK + CLI
 > See `CANVAS_SDK.md`.
 
-### 6.2 Canvas Registry & Manifest
-> Stub. Declarative manifest canvas submits at registration. Spec pending `CANVAS_SDK §2` decision.
+### 6.2 Canvas Registration
+> Owned by Integration Hub. See §4.3.4 for the data model and lifecycle, and `CANVAS_SDK.md §3` for the canvas-team-facing view. Not a separate service, not a YAML manifest.
 
 ### 6.3 Sandbox / Staging
 > Stub. Canvas-facing staging environment for integration testing before prod rollout.
