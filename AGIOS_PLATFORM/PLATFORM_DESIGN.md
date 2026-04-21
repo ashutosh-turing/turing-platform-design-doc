@@ -625,48 +625,6 @@ Worth being explicit because architects tend to drift:
 
 ---
 
-### 7.8 Concurrency envelope & per-component SLOs
-
-The platform is designed for **50K – 1M registered workers / 200K peak concurrent**. That number is a design target, not an aspiration — every hot-path component in this document is sized against it.
-
-#### Design load
-
-| Metric | 200K concurrent (1M registered) |
-|---|---|
-| Claim QPS sustained | 330 |
-| Claim QPS peak (shift start) | 2.5K |
-| Heartbeat QPS | 6.7K |
-| Session JWT refresh QPS | 240 |
-| Active real-time sockets (SSE) | 200K |
-| Canonical events/s (all canvases, all flows) | 2.7K |
-| Capability `use` QPS (incl. heartbeat) | ~10K |
-
-Bursts at shift start, batch release, or project launch are 5–10× the sustained numbers. Every SLO below is stated against **peak burst, not mean**.
-
-#### Per-component SLOs
-
-| Component | SLO | Reference |
-|---|---|---|
-| Shell chrome static | CDN cache hit rate ≥ 99%; bootstrap payload ≤ 50 KB gzipped | — |
-| Gateway (`delivery-orchestration`) | p99 < 50 ms added overhead on capability RPC; 30K QPS sustained / 100K peak | `COMPONENT_ARCHITECTURE.md §4.8` |
-| Identity JWT refresh | p99 < 30 ms; 2K QPS sustained / 10K peak | — |
-| User Pool `claim` | p99 < 100 ms; 10K QPS sustained | `COMPONENT_ARCHITECTURE.md §5.1` (Scale / hot-path discipline) |
-| User Pool `heartbeat` | p99 < 10 ms; 50K QPS sustained | ditto |
-| Notification Edge end-to-end | bus → client p99 < 2 s; 200K concurrent sockets | `COMPONENT_ARCHITECTURE.md §4.9` |
-| IH slug resolution | p99 < 5 ms (cache hit); cache hit ≥ 99% | `COMPONENT_ARCHITECTURE.md §4.3.4` (Performance at scale) |
-| Hot bus (Redis Streams) | 100K ops/s per cluster; fan-out lag p99 < 500 ms | `§4.1` Layer 2 |
-| Audit Log durable write | 50K events/s sustained; query p99 < 1 s (90-day window) | `§4.5` |
-
-#### Stateful vs stateless tiers
-
-Only two tiers are stateful in the worker-facing path — **Notification Edge** (long-lived sockets) and **User Pool** (Redis hot-path + Postgres durable). Everything else is stateless behind a load balancer. This is a deliberate constraint: stateful-ness is expensive at 1M workers, so we pay for it only where real-time delivery or atomic claim demands it.
-
-#### What canvases inherit at Level 0
-
-Every number above is a commitment to canvases that accept defaults (Level 0). A canvas that needs more throughput than User Pool's `claim` SLO on a single pool should **shard its pool**, not step to Level 2. A canvas that needs different claim semantics moves to Level 2 and inherits its own performance envelope.
-
----
-
 ## 8. Component catalog
 
 > **Moved.** The 19-component catalog (purpose, contract, events, SDK, storage, diagrams, tech choices per component) lives in `COMPONENT_ARCHITECTURE.md`.
@@ -683,7 +641,54 @@ Every number above is a commitment to canvases that accept defaults (Level 0). A
 
 ## 10. Canonical event catalog v1
 
-> **Moved.** See `EVENT_CATALOG.md`. Envelope frozen (12 fields); v1 event list (12 events for the pay-per-task lifecycle) pending Pass 3.
+The envelope is frozen (11 fields — see `EVENT_CATALOG.md §2`). The v1 event list is **16 events in three groups**. Payload schemas, idempotency formulas, and full examples live in `EVENT_CATALOG.md`; this section pins the names and groupings so the rest of this document can reference them.
+
+### 10.1 Task lifecycle (8 events)
+
+The customer contract: a billable task moving through the platform. These events track the canonical state machine in `§11`. Applies to every canvas regardless of billing model.
+
+| Event | Emitter | Triggers state transition |
+|---|---|---|
+| `TaskCreated` | canvas | `→ Created` |
+| `TaskSubmitted` | canvas | `Claimed → Submitted` |
+| `TaskValidated` | QC / Prism | `Submitted → Validated` |
+| `TaskReworked` | QC / Prism | `Validated → Reworked` |
+| `TaskRejected` | QC / Prism | `Validated → Rejected` |
+| `TaskAccepted` | QC / Prism | `Validated → Accepted` |
+| `TaskDelivered` | canvas | `Accepted → Delivered` |
+| `TaskDeliveryAcked` | integration-hub | `Delivered → DeliveryAcked` |
+
+### 10.2 Unit lifecycle (5 events, pay-per-task-specific)
+
+The worker claim/release cycle in the pool. These are what billing consumers read to meter pay-per-task. A canvas on `fixed_aht` or `hourly` still emits them (the pool is the pool), but billing interprets them differently.
+
+| Event | Emitter | Meaning |
+|---|---|---|
+| `UnitPosted` | user-pool | A unit is available for claim |
+| `UnitClaimed` | user-pool | A worker holds a lease |
+| `UnitExpired` | user-pool | Lease TTL elapsed without submission |
+| `UnitReleased` | user-pool | Worker voluntarily released the lease |
+| `UnitCompleted` | user-pool | Lease closed via submission (paired with `TaskSubmitted`) |
+
+### 10.3 Canvas lifecycle (3 events)
+
+IH registration changes. Consumed by the worker shell's slug-resolution cache (`COMPONENT_ARCHITECTURE §4.3.4`) for invalidation. Not billable-flow.
+
+| Event | Emitter | Meaning |
+|---|---|---|
+| `CanvasRegistered` | integration-hub | A new canvas registration record exists |
+| `CanvasPromoted` | integration-hub | Canvas moved from `staging` → `prod` |
+| `CanvasDeprecated` | integration-hub | Canvas marked for sunset |
+
+Three additional canvas events (`CanvasArchived`, `CanvasCredentialRotated`, `CanvasScopeChanged`) are defined in `COMPONENT_ARCHITECTURE §4.3.4` for operational use but are not required for v1 canary; they can ship alongside or in a minor-version bump.
+
+### 10.4 What's not in v1
+
+Deferred to a later minor version, not because they're unimportant but because they're not required for OpenClaw canary:
+
+- **Operational / audit events** — `OutboundDeliveryAttempted`, `WebhookDeliveryFailed`, `CapabilityInvoked`, `RateLimitExceeded`. These ship when their emitting service lands (Audit Log, Gateway hot-path, IH Outbound). They are audit-stream events, not state-machine events.
+- **Reviewer / HITL events** — formal shape defined when the HITL Zone B capability is specified.
+- **Batch lifecycle events** — same; deferred with the Batching Zone B capability.
 
 ---
 

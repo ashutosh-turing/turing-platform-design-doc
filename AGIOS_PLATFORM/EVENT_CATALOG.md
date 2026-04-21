@@ -4,7 +4,7 @@
 
 ## Status
 
-**Draft v0.0.** Envelope is frozen (see §2). V1 event catalog is **pending Pass 3** of the platform design work.
+**Draft v0.1.** Envelope is frozen (see §2). V1 event names and groupings are frozen (see §3, mirrored in `PLATFORM_DESIGN §10`). **Payload schemas + idempotency formulas are still pending Pass 3** — the §3 table locks names so consumers can subscribe against stable topics while payloads firm up during Phase F1 implementation.
 
 ## 1. Purpose
 
@@ -40,26 +40,56 @@ Every `DomainEvent` on the bus carries this envelope. The envelope is **immutabl
 
 ## 3. Event catalog v1
 
-> **Pending Pass 3.** The 12 canonical events for the pay-per-task lifecycle will be specified here, with payload schema, idempotency formula, emitter, and example.
->
-> Proposed list (to be formalized):
->
-> | Event | Emitter | Stage |
-> |---|---|---|
-> | `TaskCreated` | canvas | create |
-> | `UnitPosted` | user-pool | pool |
-> | `UnitClaimed` | user-pool | pool |
-> | `UnitReleased` | user-pool | pool |
-> | `UnitExpired` | user-pool | pool |
-> | `TaskSubmitted` | canvas | submit |
-> | `TaskValidated` | qc | qc |
-> | `TaskRejected` | qc | qc |
-> | `TaskReworked` | qc | qc |
-> | `TaskAccepted` | qc | qc |
-> | `TaskDelivered` | canvas | deliver |
-> | `OutboundDeliveryAttempted` | integration-hub | deliver |
-> | `TaskDeliveryAcked` | integration-hub | deliver |
-> | `WebhookDeliveryFailed` | integration-hub | deliver |
+**16 events in three groups.** Names and groupings are frozen. Payload schemas + idempotency formulas are Phase F1 deliverables (Pass 3 content).
+
+### 3.1 Task lifecycle (8 events)
+
+The customer contract — a billable task traversing the canonical state machine (`PLATFORM_DESIGN §11`). Applies to every canvas regardless of billing model.
+
+| Event | Emitter | Stage | State transition | Idempotency key (preview) |
+|---|---|---|---|---|
+| `TaskCreated` | canvas | create | `→ Created` | `task_id` |
+| `TaskSubmitted` | canvas | submit | `Claimed → Submitted` | `task_id:<attempt>` |
+| `TaskValidated` | qc / prism | qc | `Submitted → Validated` | `task_id:<attempt>:validated` |
+| `TaskReworked` | qc / prism | qc | `Validated → Reworked` | `task_id:<attempt>:reworked` |
+| `TaskRejected` | qc / prism | qc | `Validated → Rejected` | `task_id:<attempt>:rejected` |
+| `TaskAccepted` | qc / prism | qc | `Validated → Accepted` | `task_id:<attempt>:accepted` |
+| `TaskDelivered` | canvas | deliver | `Accepted → Delivered` | `task_id:delivered` |
+| `TaskDeliveryAcked` | integration-hub | deliver | `Delivered → DeliveryAcked` | `task_id:delivery_acked` |
+
+### 3.2 Unit lifecycle (5 events, pay-per-task-specific)
+
+The worker claim/release cycle in the pool. Billing consumers read these to meter pay-per-task. Canvases on other billing models still emit them.
+
+| Event | Emitter | Meaning | Idempotency key (preview) |
+|---|---|---|---|
+| `UnitPosted` | user-pool | Unit available for claim | `unit_id:posted` |
+| `UnitClaimed` | user-pool | Worker holds a lease | `claim_id` |
+| `UnitExpired` | user-pool | Lease TTL elapsed | `claim_id:expired` |
+| `UnitReleased` | user-pool | Worker voluntarily released | `claim_id:released` |
+| `UnitCompleted` | user-pool | Lease closed via submission | `claim_id:completed` |
+
+### 3.3 Canvas lifecycle (3 events)
+
+IH registration changes. Consumed by the worker shell's slug-resolution cache for invalidation (`COMPONENT_ARCHITECTURE §4.3.4`). Not billable-flow.
+
+| Event | Emitter | Meaning | Idempotency key (preview) |
+|---|---|---|---|
+| `CanvasRegistered` | integration-hub | New canvas record exists | `canvas_id:registered` |
+| `CanvasPromoted` | integration-hub | Canvas moved `staging → prod` | `canvas_id:promoted:<revision>` |
+| `CanvasDeprecated` | integration-hub | Canvas marked for sunset | `canvas_id:deprecated` |
+
+### 3.4 Deferred from v1
+
+The following event families are acknowledged but deferred to a later minor version. They are not blocking the OpenClaw canary.
+
+| Family | Events (tentative) | Ships with |
+|---|---|---|
+| Canvas operational | `CanvasArchived`, `CanvasCredentialRotated`, `CanvasScopeChanged` | IH refactor Track A |
+| IH Outbound operational | `OutboundDeliveryAttempted`, `WebhookDeliveryFailed` | IH Outbound (Track A5) |
+| Gateway audit | `CapabilityInvoked`, `RateLimitExceeded` | Gateway discipline (Track D) |
+| HITL | TBD | HITL Zone B capability |
+| Batching | TBD | Batching Zone B capability |
 
 ## 4. Payload schema conventions
 
@@ -79,4 +109,4 @@ Existing event types in `services/shared/shared/events/types.py`:
 - `QAReviewCompleted`, `SignOffApproved`
 - `WebhookReceived`, `ConnectorInvoked`
 
-**Gap.** These cover project lifecycle and integration mechanics but do not yet cover the pay-per-task lifecycle (create → claim → submit → QC → deliver → ack). The v1 catalog in §3 adds those, plus upgrades the envelope to carry `project_id`, `idempotency_key`, `schema_version`, `correlation_id`, `causation_id`, and `canvas_id` which today's `DomainEvent` base class does not have.
+**Gap.** These cover project lifecycle and integration mechanics but do not cover the canonical task/unit/canvas lifecycles (`§3.1` – `§3.3`). The v1 catalog adds all 16 events, plus upgrades the envelope to carry `project_id`, `idempotency_key`, `schema_version`, `correlation_id`, `causation_id`, and `canvas_id` — none of which today's `DomainEvent` base class has. See `KICKOFF.md §5 F1` for the implementation plan.
