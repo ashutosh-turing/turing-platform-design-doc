@@ -1111,7 +1111,7 @@ Eligibility policies are **composable** — a pool can declare multiple and all 
 >
 > **Zone + status.** Zone B. `not-implemented`.
 >
-> **Target.** Published as `canvas-starter/` in the monorepo (or as a separate repo `canvas-starter`). Consumers of the template receive: (a) a Dockerfile that runs, (b) a `canvas.config.yaml` for project-level overrides (task types, instructions URL, review model, rate card reference), (c) prewired `@agi-os/canvas-sdk` bridge, (d) a working React app scaffold with default Instructions/Workspace/Submission UI zones, (e) example emitters for `TaskCreated` + `TaskSubmitted`. OpenClaw (our canary) is the first user of this template and de facto its functional test.
+> **Target.** Published as `canvas-starter/` in the monorepo (or as a separate repo `canvas-starter`). Consumers of the template receive: (a) a Dockerfile that runs, (b) a `canvas.config.yaml` for project-level overrides (task types, instructions URL, review model, rate card reference), (c) prewired `@turing/canvas-guest` (from the `turing-canvas-sdk` repo — see `CANVAS_SDK §7`), (d) a working React app scaffold with default Instructions/Workspace/Submission UI zones, (e) example emitters for `TaskCreated` + `TaskSubmitted`. OpenClaw (our canary) is the first user of this template and de facto its functional test.
 >
 > **Anti-goal.** Template is **not** a runtime dependency. A forked template and its parent must diverge independently; there's no "update template → all canvases update" contract. Template is a starting point, not a framework.
 

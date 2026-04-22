@@ -4,7 +4,7 @@
 
 ## Status
 
-**Draft v0.5.** Worker-shell architecture: **iframe + bridge SDK**. **Canvas registration is owned by Integration Hub** (no YAML manifest — §3 is a pointer, not a schema). **Capability adoption is runtime discovery, MCP-style** (§4). v1 bridge surface is deliberately minimized (§2.5).
+**Draft v0.8.** Worker-shell architecture: **iframe + bridge SDK**. **Canvas registration is owned by Integration Hub** (no YAML manifest — §3 is a pointer, not a schema). **Capability adoption is runtime discovery, MCP-style** (§4). v1 bridge surface is deliberately minimized (§2.5). **SDK ships from its own repo `turing-canvas-sdk`, TypeScript-only, as two public packages — `@turing/canvas-host` (shell) and `@turing/canvas-guest` (canvas)** — plus `@turing/canvas-schemas` as a language-agnostic contract artifact for polyglot backends (§7).
 
 ## 1. Introduction
 
@@ -43,7 +43,7 @@ flowchart TB
     end
     subgraph Iframe["Iframe: canvas.&lt;id&gt;.turing.com"]
         CanvasApp["Canvas app (any stack)"]
-        BridgeClient["@agi-os/canvas-sdk"]
+        BridgeClient["@turing/canvas-guest"]
     end
     Worker --> Chrome
     Chrome --> ShellApp
@@ -52,7 +52,7 @@ flowchart TB
     BridgeClient --> CanvasApp
 ```
 
-**Mechanics.** Shell mounts `<iframe src="canvas.{id}.turing.com/...">` at the `/:canvas_id/*` route. All shell↔canvas interaction is `postMessage` mediated by `@agi-os/canvas-sdk`. Auth token is minted by the shell (§5) and delivered via the bridge's first message. Chrome actions (toast, navigate, modal) are canvas → shell requests (§4.2).
+**Mechanics.** Shell mounts `<iframe src="canvas.{id}.turing.com/...">` at the `/:canvas_id/*` route. All shell↔canvas interaction is `postMessage` mediated by two SDK packages published from the `turing-canvas-sdk` repo (§7): `@turing/canvas-host` (installed by the shell, mounts the iframe and dispatches messages) and `@turing/canvas-guest` (installed by each canvas, handles handshake and message send/receive). Auth token is minted by the shell (§5) and delivered via the bridge's first message. Chrome actions (toast, navigate, modal) are canvas → shell requests (§4.2).
 
 ### 2.2 Why this path
 
@@ -310,12 +310,12 @@ Handshake rules:
 
 ### 4.4 SDK surface
 
-Platform ships `@agi-os/canvas-sdk` (TypeScript). The canvas-facing API is flat: `bridge.send(type, payload)` and `bridge.on(type, handler)`. Wrappers for the most-used messages live as named helpers.
+Platform ships TypeScript packages from the `turing-canvas-sdk` repo (see §7 for full repo spec). Canvas teams install **`@turing/canvas-guest`**; the shell team installs **`@turing/canvas-host`**. Shared internals (envelope, correlation, error taxonomy) live in a private workspace package (`_internal/bridge-core`) bundled into both — consumers never see it. Polyglot canvas **backends** consume `@turing/canvas-schemas` (JSON Schema only, no code) for payload validation. The canvas-facing API is flat: `bridge.send(type, payload)` and `bridge.on(type, handler)`. Wrappers for the most-used messages live as named helpers.
 
-Canvas side:
+Canvas (guest) side:
 
 ```typescript
-import { bridge } from "@agi-os/canvas-sdk";
+import { bridge } from "@turing/canvas-guest";
 
 await bridge.connect();
 
@@ -333,12 +333,12 @@ if (bridge.session.expiresInSeconds() < 60) {
 }
 ```
 
-Shell side (same SDK package, different entry point):
+Shell (host) side:
 
 ```typescript
-import { ShellHost } from "@agi-os/canvas-sdk/shell";
+import { CanvasHost } from "@turing/canvas-host";
 
-const host = new ShellHost({
+const host = new CanvasHost({
   iframe: iframeEl,
   canvasRecord,  // fetched from IH by canvas_id
   mintToken: async () => await mintCanvasScopedToken({ canvasId, workerId }),
@@ -607,7 +607,7 @@ Exit criteria: a staging task round-trips through your canvas emitting the full 
 
 1. Pick your stack. Any stack. React, Vue, Svelte, vanilla — all fine.
 2. Serve your canvas at your `entry_url` origin. (Typically a subdomain you own — platform does not mandate a shape.)
-3. Install `@agi-os/canvas-sdk`. Implement:
+3. Install `@turing/canvas-guest` (from the `turing-canvas-sdk` repo — see §7). Implement:
    ```typescript
    await bridge.connect();
    bridge.on("session.ready", ({ token, canvasId, workerId, projectId }) => { ... });
@@ -680,3 +680,182 @@ Three examples mapping real canvases onto the playbook. Each is a sketch; the ca
 - **Emitted.** Full canonical lifecycle; no canvas-specific events.
 - **Consumed.** `UnitClaimed`, `TaskAccepted`, `TaskRejected`, `TaskDeliveryAcked`.
 - **Why defaults everywhere.** New canvas, no legacy system, no special requirements. Ships in two weeks.
+
+## 7. SDK Repository
+
+### 7.1 Decisions
+
+| Decision | Value | Rationale |
+|---|---|---|
+| **Location** | Separate repo: `turing-canvas-sdk` | The SDK is a **contract**, not a feature. A separate repo enforces boundary discipline, independent semver, and decouples release cadence from platform services. |
+| **Implementation language** | **TypeScript** (client code) | Canvas frontends are TS, shell is TS, `postMessage` is a browser primitive. One toolchain. No Python client SDK maintained by the platform team. |
+| **Contract language** | **JSON Schema** (language-agnostic) | Published as a separate artifact so polyglot canvas backends (Python, Node, Go) can validate payloads without depending on our TS code. |
+| **Monorepo layout** | pnpm + turbo | Canvas-side and shell-side packages share internals (envelope, schemas, error taxonomy) but publish independently. |
+| **Version management** | Changesets + semver | Every PR touching a published package requires a changeset entry. Major bumps require explicit justification. This is the SemVer enforcement lever. |
+| **Contract tests** | Playwright, bidirectional | Real `postMessage` traffic between `hello-host` and `hello-guest`. Merge gate. |
+
+### 7.2 Repository structure
+
+Two public SDK packages, one public schemas artifact, one private internal package. Consumers see exactly three names on npm; internal code is bundled at build time.
+
+```
+turing-canvas-sdk/
+├── packages/
+│   ├── canvas-host/                    # @turing/canvas-host   (PUBLIC — shell / host side)
+│   │   ├── src/index.ts                # CanvasHost class: mounts iframe, dispatches messages,
+│   │   │                                 enforces grants, forwards minted tokens
+│   │   └── README.md                   # Shell team's entry point
+│   ├── canvas-guest/                   # @turing/canvas-guest  (PUBLIC — canvas side)
+│   │   ├── src/index.ts                # bridge.connect(), bridge.send(), bridge.on(), session
+│   │   └── README.md                   # Canvas team's entry point
+│   ├── canvas-schemas/                 # @turing/canvas-schemas (PUBLIC — JSON Schema only, no code)
+│   │   ├── bridge/v1/
+│   │   │   ├── envelope.json
+│   │   │   ├── session.ready.json
+│   │   │   ├── task.assign.json
+│   │   │   ├── task.submit.json
+│   │   │   ├── task.save_draft.json
+│   │   │   ├── shell.toast.json
+│   │   │   └── shell.instructions.open.json
+│   │   ├── events/v1/                  # Canonical events a canvas may emit (pointer to EVENT_CATALOG.md)
+│   │   ├── index.json                  # Manifest: version, message list, compatibility
+│   │   └── README.md                   # How non-TS backends consume these
+│   └── _internal/
+│       └── bridge-core/                # PRIVATE — not published; bundled into host + guest
+│           ├── package.json            # "private": true
+│           ├── src/envelope.ts         # Message envelope, correlation, version negotiation
+│           ├── src/errors.ts           # Structured error taxonomy
+│           └── src/version.ts          # Protocol version constants
+├── examples/
+│   ├── hello-host/                     # Minimal shell host (Vite + React, embeds hello-guest)
+│   │   └── src/App.tsx
+│   └── hello-guest/                    # Minimal canvas guest (~200 LOC)
+│       └── src/App.tsx                 # Claim → render → submit round-trip
+├── tests/
+│   └── contract/                       # Playwright bidirectional contract tests
+│       ├── session.spec.ts             # Handshake, version negotiation, token handoff
+│       ├── task-assign.spec.ts
+│       ├── task-submit.spec.ts
+│       ├── save-draft.spec.ts
+│       ├── shell-actions.spec.ts       # toast + instructions.open
+│       └── error-cases.spec.ts         # Timeouts, malformed messages, wrong origin
+├── docs/
+│   ├── getting-started.md              # 10-min path from clone to round-trip
+│   ├── bridge-protocol.md              # Wire format spec (source of truth for §4)
+│   ├── auth-handoff.md                 # Source of truth for §5
+│   ├── versioning.md                   # SemVer policy, deprecation, compatibility matrix
+│   ├── registration.md                 # How to register a canvas with IH (pointer to §3)
+│   └── polyglot-backends.md            # How Python/Go/Node backends consume schemas
+├── .changeset/                         # Version bump entries per PR
+├── .github/workflows/
+│   ├── ci.yml                          # Lint, typecheck, unit tests, contract tests
+│   └── release.yml                     # Changesets → npm publish
+├── turbo.json
+├── package.json
+├── pnpm-workspace.yaml
+└── README.md                           # Repo-level overview, links into docs/
+```
+
+### 7.3 Published artifacts
+
+Three public npm packages. One private internal package (bundled, not published). One repo.
+
+| Package | Consumer | Contents | Stability |
+|---|---|---|---|
+| **`@turing/canvas-host`** | Worker shell team (single consumer today) | `CanvasHost` class: iframe mount, dispatch, timeouts, grant enforcement, token forwarding | **Public; strict SemVer** |
+| **`@turing/canvas-guest`** | Canvas frontend teams (OpenClaw, TB, GDPVal, …) | `bridge.connect()`, `bridge.send()`, `bridge.on()`, session helpers | **Public; strict SemVer** |
+| `@turing/canvas-schemas` | Polyglot canvas backends, validators, tooling | Pure JSON Schema files + manifest | **Public; SemVer applies to schema shape** |
+| `_internal/bridge-core` | Internal dep of host + guest only | Envelope types, error taxonomy, version constants | **Private — `"private": true`, bundled at build time, never published.** Consumers never see it. |
+
+Python, Go, or Node backends consume `@turing/canvas-schemas` by:
+
+1. **npm**: `npm i @turing/canvas-schemas` in any project (even pure Python projects via `npm` + a vendoring step), or
+2. **Direct URL**: `curl https://unpkg.com/@turing/canvas-schemas@1.0.0/bridge/v1/task.submit.json` — pin the version, vendor the file.
+
+Either way they use their native validator (Python `jsonschema`, Go `gojsonschema`, etc.). No Python SDK to maintain.
+
+### 7.4 What lives in this repo vs. elsewhere
+
+| Lives in `turing-canvas-sdk` | Lives elsewhere |
+|---|---|
+| Bridge protocol wire format | Shell app itself (`agi-os` or dedicated `canvas-agi-os` repo) |
+| Bridge message schemas | Canvas implementations (per-canvas repos) |
+| Session + auth handoff helpers (client code) | JWT signing key + JWKS endpoint (owned by IH or shell backend) |
+| Contract tests (bidirectional) | Canvas-specific integration tests |
+| `hello-host` and `hello-guest` examples | Per-canvas onboarding docs |
+| Versioning policy | Canvas registration records (owned by IH) |
+| Event envelope JSON Schema | Event routing, outbox, bus (platform services) |
+
+The rule: **if it defines the contract, it lives here. If it implements behavior behind the contract, it lives elsewhere.**
+
+### 7.5 Versioning policy
+
+SemVer applies to each published package independently.
+
+- **MAJOR**: breaking change to the wire protocol or published types. Requires a migration path and a deprecation window (minimum 2 minor versions).
+- **MINOR**: additive message types, additive fields (optional), new capability grants recognized.
+- **PATCH**: bug fixes, docs, internal refactors with no surface change.
+
+**Protocol version is separate from package version.** The envelope carries `protocol_version: "1.x"`. Any package that implements `1.x` must interop with any other package that implements `1.x`. MAJOR package bumps may be backward-compatible at the protocol level; the envelope version changes only when the wire format itself changes.
+
+**Compatibility matrix** is published in `docs/versioning.md` and updated on every release.
+
+### 7.6 CI / release pipeline
+
+| Stage | What runs | Gate |
+|---|---|---|
+| **PR opened** | Lint, typecheck, unit tests, contract tests, changeset presence check | All green required to merge |
+| **Merge to `main`** | Changesets aggregates pending version bumps into a "Release PR" | Release PR is reviewed by platform lead |
+| **Release PR merged** | `pnpm publish` for each package whose version changed, GitHub Release with changelog | Tags cut, docs published |
+| **Nightly** | Contract tests against `hello-host` + `hello-guest` at `@latest` | Flaky-test tracker |
+
+### 7.7 Consumers
+
+| Consumer | Package | Notes |
+|---|---|---|
+| Worker shell (`canvas-agi-os.turing.com`) | `@turing/canvas-host` | Single host consumer v1 |
+| OpenClaw canvas frontend | `@turing/canvas-guest` | Canonical "use defaults" canvas |
+| GDPVal canvas frontend (migration) | `@turing/canvas-guest` | Wraps existing Firestore-backed UI |
+| TB canvas frontend (migration) | `@turing/canvas-guest` | Wraps existing Temporal-backed UI |
+| Canvas backends (any language) | `@turing/canvas-schemas` | JWT verification is ~15 lines of native code per stack; not SDK-worthy |
+
+### 7.8 Scope fence — what is NOT in this repo
+
+To prevent scope creep:
+
+- **No UI component library.** Canvases pick their own stack and component library.
+- **No canvas scaffolding CLI.** `examples/hello-guest` is the reference; teams copy-paste. Revisit at 5+ canvases.
+- **No backend frameworks.** Canvas backends use whatever they want; they only consume JSON Schemas for validation.
+- **No JWT minting.** Signing key lives in Integration Hub (or shell backend — see §5). SDK only verifies.
+- **No event publishing.** Canvases emit events via the platform event bus (outbox pattern, see `COMPONENT_ARCHITECTURE §4.1`). SDK defines the envelope schema; publishing is the canvas backend's concern.
+- **No capability discovery protocol v2.** v1 is runtime discovery via bridge messages (§4.5); advanced MCP-shaped features defer to v2+.
+
+### 7.9 Kickoff — order of work (BOE, no calendar)
+
+Single engineer can drive to `0.1.0` alpha. Parallelizable after step 3.
+
+| Step | Task | Size | Depends on | Parallelizable |
+|---|---|---|---|---|
+| 1 | Bootstrap repo: pnpm + turbo + TS config + CI skeleton + changesets | S | — | No |
+| 2 | Author JSON Schemas for envelope + 6 v1 messages in `packages/canvas-schemas/` | S | 1 | No |
+| 3 | Build `packages/_internal/bridge-core`: envelope, correlation, timeouts, error taxonomy (private, bundled) | S | 2 | No |
+| 4a | Build `packages/canvas-guest`: `bridge.connect()`, `send()`, `on()`, session helpers | S | 3 | Yes (with 4b) |
+| 4b | Build `packages/canvas-host`: `CanvasHost` class — iframe harness, dispatch, grant enforcement, token forwarding | S | 3 | Yes (with 4a) |
+| 5 | Write `examples/hello-host` and `examples/hello-guest` — must actually round-trip | M | 4a, 4b | No |
+| 6 | Author `tests/contract/` Playwright suite covering all 6 messages + error cases | M | 5 | No |
+| 7a | Auth handoff: host-side token-forward helper, guest-side token-receive + refresh + JWKS-verify helper (IH JWKS, 10-min cache) | M | 4a, 4b | Yes (with 7b) |
+| 7b | Documentation pass: `getting-started`, `bridge-protocol`, `auth-handoff`, `versioning`, `polyglot-backends` | M | 4a, 4b | Yes (with 7a) |
+| 8 | First publish: `@turing/canvas-host`, `@turing/canvas-guest`, `@turing/canvas-schemas` at `0.1.0-alpha.1`, GitHub Release | S | 7a, 7b | No |
+
+**Total: ~2–3 weeks for one engineer** to reach `0.1.0-alpha.1` with contract tests green, a working round-trip example, and docs that let a canvas team onboard without talking to platform team.
+
+### 7.10 Decision log (living)
+
+| Decision | Date | Notes |
+|---|---|---|
+| Separate repo, not monorepo inside `agi-os` | v0.7 | Boundary discipline + independent semver. Revisit if SDK churn requires >3 cross-repo PRs/week for two consecutive months. |
+| TypeScript only for client code | v0.7 | No Python client SDK maintained by platform. Polyglot backends consume JSON Schemas directly. |
+| Schemas as separate published package (`@turing/canvas-schemas`) | v0.7 | Keeps contract language-agnostic without the cost of maintaining Python/Go/Node SDKs. |
+| pnpm + turbo + changesets | v0.7 | Standard TS monorepo tooling; no special flavor of the month. |
+| Two public SDKs: `@turing/canvas-host` + `@turing/canvas-guest`; `bridge-core` demoted to private internal package | v0.8 | Names map directly to role (host/guest). Consumers see exactly two SDKs on npm matching the mental model. Shared internals bundled at build time — no version coordination surface exposed to consumers. |
+| Single contract test suite (Playwright) | v0.7 | Bidirectional real `postMessage` traffic. One test framework for the whole repo. |

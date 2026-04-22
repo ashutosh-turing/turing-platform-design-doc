@@ -107,7 +107,7 @@ Honest before-picture of `agi-os` today, grounded in real file paths:
 | Gateway | `delivery-orchestration/` with Alembic migrations. | Needs hot-path discipline audit (no sync DB on capability RPC, JWKS cache, async audit, rate limit). |
 | Worker shell | Nothing. | New frontend app + backend service. |
 | Notification Edge | Nothing. | New service. |
-| Canvas SDK | Nothing. | New npm package + Python package. |
+| Canvas SDK | Nothing. | **New separate repo `turing-canvas-sdk`.** TypeScript-only. Two public SDKs — `@turing/canvas-host` (shell) and `@turing/canvas-guest` (canvas) — plus `@turing/canvas-schemas` (JSON Schema only, language-agnostic, consumed by polyglot backends). Shared internals in private `_internal/bridge-core` bundled at build time. See `CANVAS_SDK §7`. |
 
 ---
 
@@ -203,18 +203,23 @@ Starts the day ADR-001 merges. Internally parallelizable where shown. Converges 
 
 ### S1 — Canvas SDK bridge protocol
 
-**Size:** M (8–12 days)
+**Size:** M (10–15 days)
 **Depends on:** ADR-001 (for `task.event` payload shape; rest is event-independent)
-**Where:** new `frontend/packages/canvas-sdk/`
+**Where:** **new repo `turing-canvas-sdk`** (separate from `agi-os`). TypeScript-only. Full spec in `CANVAS_SDK §7`.
 
-**Deliverables:**
-- `@agi-os/canvas-sdk` npm package.
-- `bridge.connect()`, `bridge.send(type, payload)`, `bridge.on(type, handler)` — flat API per `CANVAS_SDK §4`.
-- Handshake, session handling, capability discovery message layer.
-- Shell-side entry: `@agi-os/canvas-sdk/shell` — `ShellHost`.
-- Examples + README; publishable as internal package first.
+**Deliverables (three public packages, one private):**
+- **`@turing/canvas-host`** (public) — `CanvasHost` class: iframe mount, dispatch, grant enforcement, token forwarding. Installed by the worker shell.
+- **`@turing/canvas-guest`** (public) — `bridge.connect()`, `bridge.send()`, `bridge.on()`, session helpers. Installed by canvas teams.
+- **`@turing/canvas-schemas`** (public) — language-agnostic JSON Schema files for envelope + 6 v1 messages. Consumed by polyglot canvas backends (Python/Go/Node) via native `jsonschema` validators.
+- `_internal/bridge-core` (private, `"private": true`) — envelope, correlation, timeouts, error taxonomy. Bundled into `canvas-host` and `canvas-guest` at build time. Never published.
 
-**Exit:** two-page test harness (mock shell + mock canvas) passes full handshake + capability discovery + session mint + toast + task.event.
+**Supporting infra in-repo:**
+- pnpm + turbo monorepo, changesets for semver.
+- `examples/hello-host` + `examples/hello-guest` (minimal round-trip).
+- `tests/contract/` bidirectional Playwright suite — merge gate.
+- Docs: `getting-started`, `bridge-protocol`, `auth-handoff`, `versioning`, `polyglot-backends`.
+
+**Exit:** three public packages publish at `0.1.0-alpha.1`; `hello-guest` embedded in `hello-host` completes the round-trip (handshake + capability discovery + session mint + task.assign + task.submit + toast); contract tests green in CI; a Python snippet in `docs/polyglot-backends.md` validates a `task.submit` payload against `@turing/canvas-schemas` using stdlib `jsonschema`.
 
 ### S2 — `worker-experience-service`
 
@@ -240,7 +245,7 @@ Starts the day ADR-001 merges. Internally parallelizable where shown. Converges 
 **Deliverables:**
 - Vite + React.
 - Left-nav chrome, iframe host component, routing on `/<slug>/*`.
-- Bridge host via `@agi-os/canvas-sdk/shell`.
+- Bridge host via `@turing/canvas-host`.
 - Calls `worker-experience-service` for bootstrap + session mint.
 - Placeholder notification panel (real SSE wiring comes in S5).
 
