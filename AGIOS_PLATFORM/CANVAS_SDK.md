@@ -431,10 +431,14 @@ Protocol version lives in the envelope `version` field. Within a major version, 
 
 Two credential types, serving two different concerns. Do not conflate them.
 
-| Credential | Who holds it | What it authorizes | Lifetime |
-|---|---|---|---|
-| **Canvas service credentials** | Canvas backend | Calling platform services (publish events, read config, call capability APIs server-to-server) | Long-lived, rotated on schedule or on demand |
-| **Canvas-scoped session JWT** | Canvas frontend (iframe), via the bridge | Scoped to one worker in one project, short-lived | 15 min default, refreshable |
+| Credential | Who holds it | Signed by | What it authorizes | Lifetime |
+|---|---|---|---|---|
+| **Canvas service credentials** | Canvas backend | — (OAuth client creds, not a JWT) | Calling platform services (publish events, read config, call capability APIs server-to-server) | Long-lived, rotated on schedule or on demand |
+| **Canvas-scoped session JWT** | Canvas frontend (iframe), via the bridge | **Integration Hub** (via GCP KMS) | Scoped to one worker in one project on one canvas, short-lived | 15 min default, refreshable |
+
+**Signing authority, decided.** Canvas-scoped JWTs are signed by the **Integration Hub**, because IH is already the authority for what a canvas is allowed to do (registration + grants). The private key lives in **GCP KMS** — IH never holds the raw key material in memory, it calls `kms.asymmetricSign()` for every mint. JWKS is published by IH at `https://ih.agi-os.turing.com/.well-known/jwks.json`. Rotation, revocation, and operational specifics are in §5.7.
+
+The shell's worker-session JWT is a **separate concern** signed by the `worker-experience-service`. It proves worker identity to the shell; it is not what canvases see. Do not confuse the two.
 
 ### 5.1 Canvas service credentials (backend-to-platform)
 
@@ -449,13 +453,13 @@ Scope on service credentials is **narrower than frontend scope** — canvas back
 
 ### 5.2 Canvas-scoped session JWT (frontend, per worker)
 
-The worker is authenticated to AGI-OS via the shell's JWT cookie (existing pattern, `services/shared/shared/auth/`). That cookie is scoped to `canvas-agi-os.turing.com`, the canvas lives at a different origin, and cross-origin cookies don't travel — which is what we want. The canvas does not need shell authority.
+The worker is authenticated to AGI-OS via the shell's session cookie (existing pattern, `services/shared/shared/auth/`). That cookie is scoped to `canvas-agi-os.turing.com`, the canvas lives at a different origin, and cross-origin cookies don't travel — which is what we want. The canvas does not need shell authority.
 
-Shell mints a **canvas-scoped JWT** for each iframe session. Claims:
+Shell requests a **canvas-scoped JWT** from IH for each iframe session. IH signs it. Claims:
 
 ```json
 {
-  "iss": "https://identity.agi-os.turing.com",
+  "iss": "https://ih.agi-os.turing.com",
   "sub": "worker:12345",
   "aud": "canvas:cvs_7f3a9b",
   "canvas_id": "cvs_7f3a9b",
@@ -465,17 +469,20 @@ Shell mints a **canvas-scoped JWT** for each iframe session. Claims:
   "scope": ["user_pool:claim", "user_pool:heartbeat", "task:submit", "artifact:write"],
   "iat": 1761234567,
   "exp": 1761235467,
-  "jti": "uuid"
+  "jti": "uuid",
+  "kid": "ih-2026-04"
 }
 ```
 
 Properties:
 
+- **Issuer is IH.** `iss = https://ih.agi-os.turing.com`. Enforced by canvas backends during JWKS verification.
 - **Short-lived.** 15-minute TTL by default.
 - **Narrowly scoped.** Worker + project + canvas + optional task + explicit scope list.
 - **Platform-authoritative `canvas_id`.** Not user-chosen — the IH-assigned `cvs_*` nonce (§3.3).
-- **Scope reflects IH grants.** The scope list is derived from the canvas's IH-registered capability grants intersected with the worker's role.
-- **Refreshable** via `session.refresh`. **Revocable** via `session.refreshed` push.
+- **Scope reflects IH grants.** The `scope` claim is derived directly from the canvas's IH-registered capability grants, intersected with the worker's role. Since IH owns both the grants and the signing key, there is no drift surface.
+- **Key ID (`kid`)** selects the public key in JWKS for verification. Enables smooth rotation (§5.7).
+- **Refreshable** via `session.refresh`. **Revocable** via the revocation list (§5.7).
 
 ### 5.3 Flow
 
@@ -483,41 +490,45 @@ Properties:
 sequenceDiagram
     participant Worker
     participant Shell as Worker Shell (canvas-agi-os.turing.com)
-    participant Gateway as AGI-OS Gateway
     participant IH as Integration Hub
-    participant Identity as Identity Service
+    participant KMS as GCP KMS
     participant Canvas as Canvas iframe
     participant CanvasAPI as Canvas backend
 
-    Worker->>Shell: login (shell JWT cookie set)
+    Worker->>Shell: login (shell session cookie set)
     Worker->>Shell: navigate /:canvas_slug/tasks/t-123
-    Shell->>IH: resolve slug → canvas_id + capability grants
-    IH-->>Shell: { canvas_id: cvs_7f3a9b, scopes: [...] }
-    Shell->>Gateway: mint canvas-scoped session JWT
-    Gateway->>Identity: sign JWT with claims
-    Identity-->>Gateway: token
-    Gateway-->>Shell: token
-    Shell->>Canvas: load iframe
+    Note over Shell,IH: One IH call does both: resolve slug AND mint token
+    Shell->>IH: POST /sessions/mint { worker_id, canvas_slug, project_id, task_id }
+    IH->>IH: resolve slug → canvas_id, look up grants, derive scope
+    IH->>KMS: asymmetricSign(payload)
+    KMS-->>IH: signature
+    IH-->>Shell: { canvas_id, entry_url, token, ttl_seconds, scope }
+    Shell->>Canvas: load iframe at entry_url
     Canvas->>Shell: handshake.hello
-    Shell-->>Canvas: response
+    Shell-->>Canvas: handshake response
     Shell->>Canvas: session.ready { token, canvas_id, worker_id, project_id, ... }
     Canvas->>CanvasAPI: GET /tasks/t-123 (Authorization: Bearer token)
-    CanvasAPI->>Identity: JWKS verify
+    CanvasAPI->>IH: fetch JWKS (cached, 10-min TTL)
+    IH-->>CanvasAPI: JWKS { keys: [...] }
+    CanvasAPI->>CanvasAPI: verify JWT signature + iss + aud + exp
     CanvasAPI-->>Canvas: task data
 
     Note over Canvas: ~14 min later
     Canvas->>Shell: session.refresh
-    Shell->>Gateway: mint new session JWT
-    Gateway-->>Shell: fresh token
-    Shell-->>Canvas: response { token, ttl_seconds }
+    Shell->>IH: POST /sessions/mint (same args, new mint)
+    IH->>KMS: asymmetricSign
+    IH-->>Shell: fresh token
+    Shell-->>Canvas: session.refreshed { token, ttl_seconds }
 ```
+
+Key change from prior drafts: **the shell makes exactly one IH call** to go from "worker clicked a canvas slug" to "canvas has a token." Slug resolution, grant lookup, and token mint are combined in `POST /ih/sessions/mint`. No extra hop — the hop to resolve the slug was always there.
 
 ### 5.4 Backend verification
 
 Canvas backends verify the session JWT via:
 
-1. **JWKS** — shared public keys from the identity service. Standard JWT library. **Default.**
-2. **Introspection endpoint** — `POST /identity/introspect`. Required only if the canvas needs sub-TTL revocation awareness.
+1. **IH JWKS** — `GET https://ih.agi-os.turing.com/.well-known/jwks.json`. Cache for 10 minutes. Standard JWT library. **Default.** Required checks: `iss == "https://ih.agi-os.turing.com"`, `aud` matches the canvas's own `canvas_id`, `exp` in future, signature valid against the `kid`-selected key.
+2. **Revocation check** — optional. Only needed by high-trust canvases that require sub-TTL revocation awareness. See §5.7.
 
 ### 5.5 Scope enforcement
 
@@ -540,6 +551,38 @@ Scope strings are enumerated per capability. The live list is served by `capabil
 - **Other projects' data.** Token is project-scoped (one project per token).
 - **Operator permissions.** Even if the human is also an admin operator, the session JWT carries only worker scope.
 - **Capabilities not granted in IH.** `scope` claim is derived from IH grants; the canvas cannot ask for more at runtime.
+
+### 5.7 Key management, rotation, revocation
+
+The operational shape of IH as signing authority. All of these are IH responsibilities — see `COMPONENT_ARCHITECTURE §4.3.6`.
+
+**Key storage.** Asymmetric keypair (RS256 or EdDSA) lives in **GCP KMS**. IH has `kms.signer` role on the keyring; it never exports the private key. Signing is one `kms.asymmetricSign()` RPC per mint. At 55 mints/s peak (per §5.3 calculation for 200K concurrent workers at hourly refresh), KMS cost and latency are both trivial.
+
+**JWKS endpoint.** `https://ih.agi-os.turing.com/.well-known/jwks.json`. Serves the set of currently-valid public keys. Each key has a `kid` matching the `kid` claim in tokens it signed. Canvas backends cache the JWKS response for 10 minutes — fast to refresh, slow enough to not hammer IH.
+
+**Key rotation.** Monthly cadence. The flow:
+
+1. ~24 hours before activation, new keypair is created in KMS with `kid = ih-<yyyy-mm>`. Public key is published in JWKS alongside the current key.
+2. At activation time, IH flips a config flag to sign new tokens with the new `kid`.
+3. The previous key stays in JWKS until all tokens signed with it have expired (max 15 min) plus a 5-minute safety margin.
+4. After that window, the old key is removed from JWKS. Its public key remains retrievable via an audit-only endpoint for forensic purposes; the private key stays in KMS (disabled, not deleted) for at least 90 days.
+
+Canvas backends experience rotation as a JWKS refresh. No canvas-side coordination, no coordinated deploys.
+
+**Revocation.** Short-TTL tokens (15 min) make revocation mostly a non-issue — terminate a worker, and within 15 minutes all their outstanding canvas tokens expire. For cases that cannot tolerate 15 minutes of exposure (security incident, compliance breach), IH maintains a `revoked_worker_sessions` set in Redis:
+
+- Key: `revoked:<jti>` with TTL = remaining token lifetime.
+- Populated by an admin action in IH or by automated worker-suspend flows.
+- High-trust canvas backends call `POST /ih/sessions/verify` (≤5 ms, cached) on sensitive operations to consult the list. Most canvases trust the signature alone and accept the 15-minute max window.
+
+**Key compromise response.** If the private key is suspected compromised:
+
+1. Disable the KMS key version immediately (KMS operation, seconds).
+2. Rotate to a fresh `kid` in JWKS (same flow as monthly rotation, just compressed).
+3. Dump all currently-valid `jti`s into the revocation list to invalidate any in-flight tokens signed by the compromised key.
+4. Audit signing requests from KMS logs for the compromise window.
+
+Blast radius is bounded by: (a) private key never left KMS, so "compromise" means compromising KMS or IH's service account, not exfiltrating a key file; (b) even in that case, all suspicious tokens are gone within 15 minutes + revocation list.
 
 ---
 
@@ -780,7 +823,7 @@ Either way they use their native validator (Python `jsonschema`, Go `gojsonschem
 |---|---|
 | Bridge protocol wire format | Shell app itself (`agi-os` or dedicated `canvas-agi-os` repo) |
 | Bridge message schemas | Canvas implementations (per-canvas repos) |
-| Session + auth handoff helpers (client code) | JWT signing key + JWKS endpoint (owned by IH or shell backend) |
+| Session + auth handoff helpers (client code) | JWT signing key in GCP KMS + JWKS endpoint (owned by Integration Hub — see §5.7 and `COMPONENT_ARCHITECTURE §4.3.6`) |
 | Contract tests (bidirectional) | Canvas-specific integration tests |
 | `hello-host` and `hello-guest` examples | Per-canvas onboarding docs |
 | Versioning policy | Canvas registration records (owned by IH) |

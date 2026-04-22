@@ -687,6 +687,109 @@ dos_ih_platform_provider_integrations (
 2. A canvas cannot directly address a platform-provider integration — it asks a capability (e.g. `artifact.sign_url`), and the capability routes to the configured provider. Swapping providers is a capability-config change, not a canvas change.
 3. Rotation is the default path; manual rotation is always available.
 
+#### 4.3.6 Canvas session token minting (signing authority)
+
+IH is the signing authority for canvas-scoped session JWTs. This follows from IH already owning the grant model — the token is just the cryptographic expression of grants IH already holds, so splitting key ownership from grant ownership would create a drift surface. Full protocol spec in `CANVAS_SDK §5`; this subsection documents the IH-side responsibilities.
+
+##### Why IH signs these tokens
+
+| Authority | Signer |
+|---|---|
+| Worker-identity session ("is this Ashu, a real Turing worker?") | `worker-experience-service` |
+| Canvas grant session ("can this worker, on this canvas, do these things right now?") | **Integration Hub** |
+
+Canvas grants (`dos_ih_canvas_capability_grants`) live in IH. So does `canvas_id`, `slug`, `lifecycle` state, and credential refs. Putting the signing key anywhere else means another service needs to cache or re-derive this state — creating drift, audit-trail duplication, and a wider key-compromise blast radius.
+
+##### Endpoint
+
+```
+POST /ih/sessions/mint
+  Body: { worker_id, canvas_slug, project_id, task_id? }
+  Auth: caller (the shell) presents its worker-session cookie/JWT
+  Response: { canvas_id, entry_url, token, ttl_seconds, scope[] }
+```
+
+One call collapses three previously separate steps: slug→canvas_id resolution, grant lookup, token mint. Since the shell was always going to call IH for slug resolution, **this doesn't add a network hop; it removes one**.
+
+##### Signing
+
+- **Key storage:** asymmetric keypair (RS256 or EdDSA) in **GCP KMS**. IH has `kms.signer` role only — the private key never leaves KMS, IH never holds raw key material.
+- **Signing call:** `kms.asymmetricSign(payload)` per mint. At projected peak 55 mints/s (200K concurrent workers × 1 mint/hour), KMS latency and cost are both trivial.
+- **`kid` claim** in every minted token identifies the signing key version; enables rotation without coordinated canvas-side deploys.
+
+##### JWKS publication
+
+```
+GET https://ih.agi-os.turing.com/.well-known/jwks.json
+  Cache-Control: public, max-age=600     # canvas backends cache 10 min
+  Returns: { keys: [{ kid, kty, alg, use: "sig", n, e }, ...] }
+```
+
+Contains the set of **currently valid** public keys. Canvas backends use stock JWKS libraries; no custom code path.
+
+##### Key rotation (monthly cadence)
+
+1. **T-24h:** new keypair `kid = ih-<yyyy-mm>` created in KMS; public key published in JWKS **alongside** the current key.
+2. **T-0:** config flag flips; IH starts signing new tokens with the new `kid`.
+3. **T + 20 min** (max token TTL + 5 min safety): old `kid` removed from JWKS.
+4. **T + 90 days:** old KMS key version can be destroyed (kept disabled in the interim for forensic retrieval).
+
+Rotation appears to canvas backends as a routine JWKS refresh. Zero coordination.
+
+##### Revocation
+
+15-min token TTL makes revocation mostly unnecessary — the shortest path to "the terminated worker stops working" is waiting for the next token mint attempt, which won't happen because the worker's shell session cookie has been invalidated. For incidents that need faster cutoff:
+
+```
+POST /ih/sessions/revoke { jti | worker_id | canvas_id }
+  → writes to Redis: SET revoked:<jti> 1 EX <remaining_ttl_seconds>
+
+POST /ih/sessions/verify { jti }
+  → returns 200 if not revoked, 403 if revoked (canvas backends with elevated trust call this on sensitive operations)
+```
+
+Most canvases trust the signature alone and accept the ≤15-minute window. High-trust canvases opt in to `verify`.
+
+##### Key compromise response
+
+1. Disable the compromised KMS key version (seconds).
+2. Emergency-rotate to fresh `kid` (same flow as monthly, compressed).
+3. Dump `jti`s signed by the compromised key into the revocation list.
+4. Audit KMS signing logs for the exposure window.
+
+Blast radius is bounded by (a) private key never left KMS, (b) all in-flight tokens invalidated within max-TTL + revocation list, (c) grant state in IH is unchanged — no re-grant ceremony needed.
+
+##### Events emitted (in addition to those in §4.3.4)
+
+| Event | When |
+|---|---|
+| `CanvasSessionMinted` | Every successful mint (sampled; full audit trail is KMS + IH request log, not the event bus) |
+| `CanvasKeyRotated` | Signing key rotation activated |
+| `CanvasSessionRevoked` | Revocation list entry added |
+
+##### Data model additions
+
+```
+dos_ih_signing_keys (
+  kid            string PK,
+  kms_key_ref    string,
+  algorithm      enum(RS256 | EdDSA),
+  status         enum(active | retiring | retired),
+  activated_at   timestamp,
+  retired_at     timestamp nullable
+)
+```
+
+Redis store for revocation:
+
+```
+Key:   revoked:<jti>
+Value: "1"
+TTL:   remaining token lifetime (≤ 900s)
+```
+
+No long-term storage for revoked sessions — once a token has expired, its `jti` in the revocation list is moot and Redis TTL clears it.
+
 <a id="43-current-state"></a>
 #### Current state vs target
 
