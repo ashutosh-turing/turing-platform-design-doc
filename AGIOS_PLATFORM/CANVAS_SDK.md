@@ -41,7 +41,7 @@ flowchart TB
         ShellApp["Shell app (React)"]
         BridgeHost["Bridge host (postMessage)"]
     end
-    subgraph Iframe["Iframe: canvas.<id>.turing.com"]
+    subgraph Iframe["Iframe: canvas.&lt;id&gt;.turing.com"]
         CanvasApp["Canvas app (any stack)"]
         BridgeClient["@agi-os/canvas-sdk"]
     end
@@ -51,8 +51,6 @@ flowchart TB
     BridgeHost <-. postMessage .-> BridgeClient
     BridgeClient --> CanvasApp
 ```
-
-
 
 **Mechanics.** Shell mounts `<iframe src="canvas.{id}.turing.com/...">` at the `/:canvas_id/*` route. All shell↔canvas interaction is `postMessage` mediated by `@agi-os/canvas-sdk`. Auth token is minted by the shell (§5) and delivered via the bridge's first message. Chrome actions (toast, navigate, modal) are canvas → shell requests (§4.2).
 
@@ -78,8 +76,8 @@ At that point: add a native loader for high-frequency first-party canvases along
 
 ### 2.4 What we commit to regardless
 
-- Worker shell at `**canvas-agi-os.turing.com`** (public worker-facing).
-- Admin shell at `**agi-os.turing.com**` (internal-only, per `PLATFORM_DESIGN §4.5`).
+- Worker shell at **`canvas-agi-os.turing.com`** (public worker-facing).
+- Admin shell at **`agi-os.turing.com`** (internal-only, per `PLATFORM_DESIGN §4.5`).
 - Canvas registration via the **Integration Hub admin console** (§3). Authoritative record lives in IH's DB, not in any YAML or git repo.
 - Canvas ↔ platform **backend** over HTTP+JSON through the gateway, plus events on the bus.
 
@@ -97,22 +95,48 @@ Inspired partly by the ICE Secure Scripting Framework model (sandboxed iframe + 
 
 **v1 explicitly does NOT ship.**
 
-
-| Deferred                                                                                           | Why we can wait                                                                                                                                                                         |
-| -------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Scripting-object wrapper** (`agios.script.getObject("shell").toast(…)` à la SSF)                 | Pure library layer on top of flat messages. Zero migration cost if added later, provided message names stay `<noun>.<verb>`.                                                            |
-| **Interactive events with veto** (host emits `precommit`, guest returns ok/cancel)                 | Powerful but raises bridge complexity meaningfully. No v1 use case that strictly requires it. Add when the first `beforeSubmit` hook is actually requested.                             |
-| **Per-role object visibility enforcement at SDK layer**                                            | Capability sets are enforced at backend + token `scope`; SDK-layer enforcement is defense-in-depth, not v1-critical.                                                                    |
-| `**@agi-os/canvas-cli` (scaffold, validate, publish, replay)**                                     | Nice DX. First canvas team ships with hand-filled IH registration form + a Vite template. Pain points inform v2 tooling rather than guessing now.                                                    |
-| **Canvas-publishes-objects-to-shell** (e.g. `canvas.review(taskId)` invoked by shell)              | v1 reviewer UX = full-page reviewer route inside the same canvas. Richer inversion waits.                                                                                               |
+| Deferred | Why we can wait |
+|---|---|
+| **Scripting-object wrapper** (`agios.script.getObject("shell").toast(…)` à la SSF) | Pure library layer on top of flat messages. Zero migration cost if added later, provided message names stay `<noun>.<verb>`. |
+| **Interactive events with veto** (host emits `precommit`, guest returns ok/cancel) | Powerful but raises bridge complexity meaningfully. No v1 use case that strictly requires it. Add when the first `beforeSubmit` hook is actually requested. |
+| **Per-role object visibility enforcement at SDK layer** | Capability sets are enforced at backend + token `scope`; SDK-layer enforcement is defense-in-depth, not v1-critical. |
+| **`@agi-os/canvas-cli` (scaffold, validate, replay)** | Nice DX. First canvas team ships by filling the IH registration form by hand + a Vite template. Pain points inform v2 tooling rather than guessing now. |
+| **Canvas-publishes-objects-to-shell** (e.g. `canvas.review(taskId)` invoked by shell) | v1 reviewer UX = full-page reviewer route inside the same canvas. Richer inversion waits. |
 | **Double-iframe HITL** (reviewer-shell chrome hosting a canvas artifact viewer in a nested iframe) | SSF proved this works in production, so the precedent exists — but v1 reviewers load the reviewer canvas standalone. Double-iframe becomes v2 if a project demands side-by-side chrome. |
-
 
 **The one forward-compat invariant we keep.**
 
-Message names are `**<noun>.<verb>`** (`shell.toast`, `task.context`, `session.ready`). Costs nothing now, makes a future scripting-object wrapper a mechanical transform if we ever want one. Nothing else is hedged.
+Message names are **`<noun>.<verb>`** (`shell.toast`, `task.context`, `session.ready`, `capabilities.use`). Costs nothing now, makes a future scripting-object wrapper a mechanical transform if we ever want one. Nothing else is hedged.
 
 **Effort envelope for v1 bridge build.** ~3 engineer-weeks: 1 week shell host library, 1 week canvas SDK, 1 week integration test + first canvas wire-up + docs. Sized to ship alongside the worker shell, not ahead of it.
+
+### 2.6 First-party worker-shell views vs canvas-owned right pane
+
+The worker shell is **not just chrome hosting a canvas iframe**. It also serves a set of first-party views that are platform-owned, cross-canvas, and exist precisely because no individual canvas should re-invent them.
+
+| View | URL | Owner | Consumes |
+|---|---|---|---|
+| **Task Marketplace** | `/tasks` | worker-experience-service (§5.15 `COMPONENT_ARCHITECTURE`) | `user-pool` claim API across all canvases the worker has grants for; live updates from hot bus |
+| **Earnings** | `/earnings` | worker-experience-service (reads billing read-model) | Billing team's read-model API (canvas contract: billing is Zone A contract; AGI-OS emits, billing computes) |
+| **Vetting** | `/<slug>/vetting` | Vetting service (§5.14 `COMPONENT_ARCHITECTURE`) | Quizzes, task-trial harness, golden-dataset grading |
+| **Settings / Profile** | `/settings` | worker-experience-service | Identity service + IH grants |
+| **Canvas task execution** | `/<slug>/*` | **Canvas** (iframe) | Canvas's own backend |
+
+**Rule of thumb.**
+
+- **A screen that spans canvases** (marketplace across 3 pools, earnings across 5 projects, profile settings) → first-party worker-shell view. Platform-owned.
+- **A screen that is the work itself** (rating UI, ranking UI, file-review workspace, SFT authoring) → canvas. Zone C.
+
+**Why this matters for canvas teams.** You do not build a task list. You do not build an earnings page. You do not build an authentication screen. You build **only the right-pane work surface**. The shell renders you inside its chrome; you emit `task.event` when work advances; the shell handles every surrounding concern.
+
+**Authored decisions that are NOT canvas-configurable** (locked by the shell):
+
+- Global navigation structure.
+- Notification panel shape (§4.9 Notification Edge delivers events; shell renders them).
+- Session management, login, logout.
+- Left-sidebar slug list (comes from IH grants via `worker-experience-service`).
+
+**Canvas can theme its right pane** — color, typography of the canvas-owned area — but cannot theme the shell chrome. This is a deliberate constraint: PRD §12.5 ("the trainer should never feel like they are moving between different companies"). Chrome consistency across canvases beats per-canvas brand flexibility.
 
 ---
 
@@ -215,7 +239,7 @@ interface BridgeEnvelope {
   version: "1.0";                // protocol version
   kind: "request" | "response" | "event";
   id: string;                    // uuidv4; request/response correlate on this
-  type: string;                  // e.g. "shell.toast", "session.ready"
+  type: string;                  // e.g. "shell.toast", "auth.ready"
   timestamp: number;             // epoch ms, from sender's clock
   payload: unknown;              // typed per `type`
   error?: BridgeError;           // populated on response, kind="response" only
@@ -247,19 +271,15 @@ Shell → Canvas messages:
 | `task.context` | event | Current task ref (route changed, task assigned) | `{ task_id, pool_id, metadata }` |
 | `notification.message` | event | Platform notification relevant to the canvas's current view | `{ severity, body, action_url? }` |
 | `canvas.dispose` | event | Worker is navigating away; canvas should persist state and stop | `{ reason }` |
-| `capabilities.changed` | event | Capability set or scope changed mid-session | `{ added: [...], removed: [...] }` |
 
 Canvas → Shell messages:
 
 | Type | Kind | Purpose | Payload |
 |---|---|---|---|
-| `handshake.hello` | request | Opens the session; negotiates protocol version (canvas identity comes from the token, not from this payload) | `{ canvas_version, protocol_supports: ["1.0"] }` → `{ protocol_accepted: "1.0", shell_version }` |
+| `handshake.hello` | request | Opens the session; canvas version negotiation only (canvas identity comes from the token) | `{ canvas_version, protocol_supports: ["1.0"] }` → `{ protocol_accepted: "1.0", shell_version }` |
 | `session.refresh` | request | Token is expiring; request fresh | none → `{ token, ttl_seconds }` |
 | `shell.toast` | request | Show toast in shell's chrome | `{ level: "info"\|"success"\|"warn"\|"error", body, duration_ms? }` → `{ ok: true }` |
-| `shell.navigate` | request | Route the shell to a path (within allowlisted prefixes) | `{ target: "/<slug>/dashboard" \| "same-canvas:/tasks/123" }` → `{ ok: true }` |
-| `capabilities.list` | request | Enumerate capabilities the token authorizes (§4.5) | none → `{ capabilities: string[] }` |
-| `capabilities.describe` | request | Get schema for one capability (§4.5) | `{ capability }` → descriptor |
-| `capabilities.use` | request | Invoke a capability method (§4.5) | `{ capability, method, args }` → method result |
+| `shell.navigate` | request | Route the shell to a path (within allowlisted prefixes) | `{ target: "/tb/dashboard" \| "same-canvas:/tasks/123" }` → `{ ok: true }` |
 | `task.event` | event | Canvas-driven task state signal; shell updates URL/breadcrumb | `{ type: "task_loaded" \| "task_submitted" \| "task_abandoned", task_id, path? }` |
 | `canvas.crash` | event | Canvas hit an unrecoverable error; shell shows recovery UI | `{ error_message, support_ref }` |
 
@@ -274,10 +294,10 @@ sequenceDiagram
     participant Shell
     participant Canvas as Canvas iframe
 
-    Shell->>Canvas: iframe load (entry_url)
+    Shell->>Canvas: iframe load (entry_url with session cookie or query nonce)
     Canvas->>Shell: handshake.hello { canvas_version, protocol_supports: ["1.0"] }
     Shell-->>Canvas: response { protocol_accepted: "1.0", shell_version }
-    Shell->>Canvas: session.ready { token, canvas_id, worker_id, project_id, ... }
+    Shell->>Canvas: session.ready { token, canvas_id, worker_id, ... }
     Shell->>Canvas: task.context { task_id, ... }
     Note over Canvas: canvas calls capabilities.list (§4.5) as needed, then renders UI
 ```
@@ -286,11 +306,11 @@ Handshake rules:
 
 1. Canvas **must** send `handshake.hello` within 5 s of iframe load. Failure → shell shows "canvas unresponsive" recovery UI.
 2. If no common protocol version in `protocol_supports`, shell sends error + shows incompatible-canvas UI.
-3. Shell delivers `session.ready` **only after** successful handshake. The `canvas_id` in that message is platform-authoritative (from the IH registration record, not from anything the canvas sent).
+3. Shell delivers `session.ready` **only after** successful handshake. The `canvas_id` in that message is platform-authoritative (from IH registration, not from anything the canvas sent).
 
 ### 4.4 SDK surface
 
-Platform ships `@agi-os/canvas-sdk` (TypeScript). The canvas-facing API is flat: `bridge.send(type, payload)` and `bridge.on(type, handler)`.
+Platform ships `@agi-os/canvas-sdk` (TypeScript). The canvas-facing API is flat: `bridge.send(type, payload)` and `bridge.on(type, handler)`. Wrappers for the most-used messages live as named helpers.
 
 Canvas side:
 
@@ -325,14 +345,23 @@ const host = new ShellHost({
   onCrash: ({ canvasId, errorMessage }) => { /* recovery UI */ },
 });
 
-host.on("shell.toast",    async ({ payload }) => { toastService.show(payload); return { ok: true }; });
-host.on("shell.navigate", async ({ payload }) => { router.push(payload.target); return { ok: true }; });
-host.on("task.event",     async ({ payload }) => { updateShellContext(payload); });
+host.on("shell.toast",     async ({ payload }) => { toastService.show(payload); return { ok: true }; });
+host.on("shell.navigate",  async ({ payload }) => { router.push(payload.target); return { ok: true }; });
+host.on("task.event",      async ({ payload }) => { updateShellContext(payload); });
 ```
 
 ### 4.5 Capability discovery (MCP-shaped)
 
 What the platform offers to a canvas — user pool, QC, IH outbound, batching, HITL, notification, artifact, config — is discovered at runtime, not declared in a static file. The pattern is MCP's: the host advertises a capability set; the client calls `list`, `describe`, and invokes.
+
+**Messages:**
+
+| Type | Kind | Direction | Purpose |
+|---|---|---|---|
+| `capabilities.list` | request | canvas → shell | Enumerate capabilities this canvas's token authorizes |
+| `capabilities.describe` | request | canvas → shell | Get full method + event schema for one capability |
+| `capabilities.use` | request | canvas → shell | Invoke a capability method (proxied to platform backend via gateway) |
+| `capabilities.changed` | event | shell → canvas | Capability set changed mid-session (e.g. scope added, capability deprecated) |
 
 **Example — user pool adoption, runtime:**
 
@@ -353,21 +382,30 @@ const claimed = await bridge.send("capabilities.use", {
 
 **What the platform does under the hood.** `capabilities.use` is not a client-side façade — it's a typed RPC. The shell forwards the call to the gateway, which routes to the owning Zone B service, which authorizes against the token's scope claim. The canvas never hits the service directly for capability calls (it still can for its own canvas-specific backend APIs).
 
-**Authorization is scope-based.** The canvas's token carries `scope: ["user_pool:claim", "user_pool:heartbeat", "ih_outbound:emit_delivered", ...]`. Platform enforces on every call. Adding a capability for a canvas is an IH admin action (grants additional scopes); deprecating one is a scope revoke plus `capabilities.changed` push.
+**Authorization is scope-based, not manifest-based.** The canvas's token carries `scopes: ["user_pool:claim", "user_pool:heartbeat", "ih_outbound:emit_delivered", ...]`. Platform enforces on every call. No YAML duplication. Adding a capability for a canvas is an IH admin action (grants additional scopes); deprecating one is a scope revoke plus `capabilities.changed` push.
 
-**Not every capability is RPC-shaped.** Some are event-pipeline-shaped: **batching**, **HITL**, **audit log**. These are consumed via event subscription, not method invocation. The canvas emits into them, they emit back. `capabilities.describe` returns an event-shape descriptor for these instead of a method list, so a canvas team can enumerate what's available uniformly.
+**Why this instead of a manifest.**
+
+| YAML manifest adoption | Runtime capability discovery |
+|---|---|
+| Static declaration of intent | Actual authorization, enforced on every call |
+| Requires PR + redeploy to add a capability | Platform operator flips a scope; takes effect immediately |
+| Drift between YAML and reality is silent | No YAML; there is no reality to drift from |
+| Cross-canvas query is a repo-wide grep | Cross-canvas query is a SQL `JOIN` against IH + scope tables |
+
+**Not every capability is MCP-shaped.** Some are event-pipeline-shaped: **batching**, **HITL**, **audit log**. These are consumed via event subscription, not method invocation. The canvas emits into them, they emit back. Capability discovery still lists them (`capabilities.describe` returns an event-shape descriptor instead of a method list) so a canvas team can enumerate what's available uniformly.
 
 ### 4.6 Security
 
 | Concern | Defense |
 |---|---|
-| Canvas impersonates another canvas | `event.origin` validated against the IH registration record's `entry_url` origin on every message |
+| Canvas impersonates another canvas | `event.origin` validated against IH-registered `entry_url` origin on every message. Identity in the token is from IH, not self-asserted. |
 | Canvas reads shell DOM | Browser same-origin policy — free |
-| Canvas navigates shell away via `shell.navigate` | Shell whitelists path prefixes; external redirects go through a separate allowlisted path |
-| Canvas exfiltrates token via XSS | Token is canvas-scoped (short TTL, single project, single worker); leak blast radius limited |
-| Shell mints token for wrong canvas | Token includes `canvas_id` claim (platform-authoritative from IH); canvas backend validates on every request |
+| Canvas navigates shell away via `shell.navigate` | Shell allowlists path prefixes to the canvas's own slug + a small set of shell routes |
+| Canvas exfiltrates token via XSS | Token is canvas-scoped: short TTL, single project, single worker; blast radius bounded |
+| Shell mints token for wrong canvas | Token `canvas_id` claim is signed by platform identity service; canvas backend verifies on every API call |
 | Replay of old token after logout | Token `jti` tracked in revocation list until TTL expiry |
-| Canvas calls a capability it wasn't granted | Gateway rejects on scope check; `capabilities.list` never returns it |
+| Capability escalation | `capabilities.use` is authorized against the token's `scope` claim — not the canvas's self-report |
 
 ### 4.7 Error codes
 
@@ -375,16 +413,17 @@ const claimed = await bridge.send("capabilities.use", {
 |---|---|
 | `unknown_type` | Receiver doesn't handle that message type |
 | `unauthorized` | Canvas sent a request before `session.ready`, or token is invalid |
-| `forbidden` | Token lacks the scope for this capability / method |
+| `forbidden` | Token valid but missing the scope for the requested capability method |
 | `timeout` | Request exceeded its timeout |
 | `rate_limited` | Canvas exceeded per-second message budget |
 | `invalid_payload` | Payload failed schema check |
 | `shell_denied` | Shell refused (e.g. navigate to non-allowlisted path) |
+| `capability_unavailable` | Canvas asked for a capability not in its set, or deprecated mid-session |
 | `canvas_closed` | Shell tried to send to a canvas that has sent `canvas.dispose` |
 
 ### 4.8 Versioning
 
-Protocol version lives in the envelope `version` field. Within a major version, new message types and optional payload fields can be added (canvases/shells ignore unknown). Major bump requires full handshake recompat: shell advertises supported versions in `handshake.hello` response, canvases pick the newest both sides support.
+Protocol version lives in the envelope `version` field. Within a major version, new message types and optional payload fields can be added (canvases/shells ignore unknown). Major bump requires full handshake recompat: shell advertises supported versions in the `handshake.hello` response, canvases pick the newest both sides support.
 
 ---
 
@@ -551,8 +590,6 @@ flowchart LR
     Gateway -- routes --> Bus
 ```
 
-
-
 Concrete steps:
 
 1. Install `@agi-os/sdk` (Python or Node).
@@ -571,7 +608,6 @@ Exit criteria: a staging task round-trips through your canvas emitting the full 
 1. Pick your stack. Any stack. React, Vue, Svelte, vanilla — all fine.
 2. Serve your canvas at your `entry_url` origin. (Typically a subdomain you own — platform does not mandate a shape.)
 3. Install `@agi-os/canvas-sdk`. Implement:
-
    ```typescript
    await bridge.connect();
    bridge.on("session.ready", ({ token, canvasId, workerId, projectId }) => { ... });
@@ -580,7 +616,6 @@ Exit criteria: a staging task round-trips through your canvas emitting the full 
    const caps = await bridge.send("capabilities.list");
    // use what you need via bridge.send("capabilities.use", { capability, method, args })
    ```
-
 4. Send `handshake.hello` on load (protocol version negotiation only — identity comes from the token).
 5. For canvas-initiated UX concerns (toast, navigation), use the bridge.
 6. Test in the staging worker shell (`staging.canvas-agi-os.turing.com/<slug>`).
@@ -609,19 +644,17 @@ Pass the harness → canvas is ready for production canary.
 
 ### 6.7 Ongoing
 
-
-| Concern                           | Platform's           | Canvas's                                |
-| --------------------------------- | -------------------- | --------------------------------------- |
-| Shell chrome                      | ✅                    | —                                       |
-| Auth infra                        | ✅                    | verify token on API                     |
-| Event bus + outbox relay          | ✅                    | write outbox rows in-transaction        |
-| Customer delivery                 | ✅ (IH Outbound)      | emit `TaskDelivered`                    |
-| QC rubrics                        | —                    | implement rubrics, emit `TaskValidated` |
-| Billing events                    | —                    | emit correctly per `pay_model`          |
-| SLO dashboards                    | ✅ (auto from events) | —                                       |
-| Canvas backend uptime             | —                    | ✅                                       |
-| Bug in canvas-specific task logic | —                    | ✅                                       |
-
+| Concern | Platform's | Canvas's |
+|---|---|---|
+| Shell chrome | ✅ | — |
+| Auth infra | ✅ | verify token on API |
+| Event bus + outbox relay | ✅ | write outbox rows in-transaction |
+| Customer delivery | ✅ (IH Outbound) | emit `TaskDelivered` |
+| QC rubrics | — | implement rubrics, emit `TaskValidated` |
+| Billing events | — | emit correctly per `pay_model` |
+| SLO dashboards | ✅ (auto from events) | — |
+| Canvas backend uptime | — | ✅ |
+| Bug in canvas-specific task logic | — | ✅ |
 
 ### 6.8 Canvas-specific walkthroughs
 
@@ -629,22 +662,21 @@ Three examples mapping real canvases onto the playbook. Each is a sketch; the ca
 
 #### 6.8.1 TB
 
-- **Capability grants requested.** `user_pool` (claim + heartbeat), `qc`, `ih_outbound`, `artifact`, `notification`. HITL handled in-canvas (TB runs its own reviewer UI but emits canonical review events).
+- **Capability grants requested.** `user_pool:*` (with strategies overridden to `SkillMatch` + `Sliding TTL` via platform config, not YAML), `qc:*`, `ih_outbound:emit_delivered`, `notification:subscribe`. HITL is TB-owned for now — emits canonical review events, does not consume the platform HITL capability.
 - **Emitted.** `TaskCreated`, `TaskSubmitted`, `TaskDelivered`, `UnitCompleted`, `CandidateReviewed` (TB-specific, in canvas-namespaced catalog).
 - **Consumed.** `UnitClaimed`, `TaskAccepted`, `TaskRejected`, `TaskDeliveryAcked`.
-- **Migration.** Existing Temporal workflows kept; outbox added to the state-store path. Frontend already React; wraps into iframe behind `canvas.tb.turing.com`.
+- **Migration.** Existing Temporal workflows kept; outbox added to the state-store path. Frontend already React; wraps into iframe at the TB-chosen subdomain.
 
 #### 6.8.2 GDPVal
 
-- **Capability grants requested.** `ih_outbound`, `artifact`, `notification`. User pool and QC handled in-canvas (GDPVal runs its own Firestore pool and a custom rubric engine; emits canonical pool + review events).
+- **Capability grants requested.** No platform `user_pool` grant — GDPVal runs its own Firestore pool and emits canonical `Unit*` events (so downstream platform consumers remain uniform). `qc:*` requested. `ih_outbound:emit_delivered`.
 - **Emitted.** Full canonical lifecycle + GDPVal-namespaced rubric events.
 - **Consumed.** `TaskDeliveryAcked`.
 - **Migration.** `app_configs` migrates to Config Service; Cloud Tasks workflow kept.
 
 #### 6.8.3 OpenClaw
 
-- **Capability grants requested.** All of them — `user_pool`, `qc`, `ih_outbound`, `batching`, `hitl`, `notification`, `artifact`, `config`. This is the canonical "consume every shell offering" canvas and the reason the platform exists.
+- **Capability grants requested.** Everything platform offers — canonical "consume the defaults" canvas. The reason the platform exists.
 - **Emitted.** Full canonical lifecycle; no canvas-specific events.
 - **Consumed.** `UnitClaimed`, `TaskAccepted`, `TaskRejected`, `TaskDeliveryAcked`.
-- **Why full adoption.** New canvas, no legacy system, no special requirements that would justify in-canvas reimplementation. Ships in two weeks.
-
+- **Why defaults everywhere.** New canvas, no legacy system, no special requirements. Ships in two weeks.

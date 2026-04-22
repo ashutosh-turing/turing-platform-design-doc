@@ -32,7 +32,7 @@ flowchart TD
     ADR["Phase 0 — ADR-001 Event envelope v2<br/>(day-1 gate, ~1 day)"]
 
     subgraph S1["Stream 1 — Foundation (internally serial)"]
-        F1[F1: Envelope code + 16 events]
+        F1[F1: Envelope code + 18 events]
         F2[F2: Outbox pattern + ref wiring]
         F3[F3: Redis Streams hot bus]
         F4[F4: Audit Log service]
@@ -135,7 +135,7 @@ This is ~1 day of work. It is the **only** thing that gates everything downstrea
 
 Starts the day ADR-001 merges. F1 → F2 → F3 → F4, strictly ordered. Do not split across engineers trying to overlap; the envelope and outbox shape need a single mind making the calls.
 
-### F1 — Envelope code + 16 events
+### F1 — Envelope code + 18 events
 
 **Size:** M (5–8 days)
 **Depends on:** ADR-001
@@ -143,13 +143,13 @@ Starts the day ADR-001 merges. F1 → F2 → F3 → F4, strictly ordered. Do not
 
 **Deliverables:**
 - `envelope.py` — `DomainEventV2` implementing the ADR. Coexists with existing `DomainEvent` (v1 stays, deprecated).
-- `catalog.py` — the 16 canonical v1 events in three groups (see `EVENT_CATALOG.md §3` for the authoritative list):
-  - **Task lifecycle** (8): `TaskCreated`, `TaskSubmitted`, `TaskValidated`, `TaskReworked`, `TaskRejected`, `TaskAccepted`, `TaskDelivered`, `TaskDeliveryAcked` — customer contract; aligned to the canonical state machine in `PLATFORM_DESIGN §11`.
+- `catalog.py` — the 18 canonical v1 events in three groups (see `EVENT_CATALOG.md §3` for the authoritative list):
+  - **Task lifecycle** (10): `TaskCreated`, `TaskSubmitted`, `TaskValidated`, `TaskReworked`, `TaskRejected`, `TaskEscalated`, `TaskAccepted`, `TaskPermanentlyRejected`, `TaskDelivered`, `TaskDeliveryAcked` — customer contract; aligned to the canonical state machine in `PLATFORM_DESIGN §11`. `TaskEscalated` + `TaskPermanentlyRejected` cover the Senior QA escalation path (max-rework / integrity / appeal → Senior QA → accept or final reject).
   - **Unit lifecycle** (5, pay-per-task pool): `UnitPosted`, `UnitClaimed`, `UnitExpired`, `UnitReleased`, `UnitCompleted` — the worker claim/release cycle feeding billing.
   - **Canvas lifecycle** (3): `CanvasRegistered`, `CanvasPromoted`, `CanvasDeprecated` — IH registration changes, consumed by the shell's slug cache.
 - `EVENT_CATALOG.md` graduates from 0.1 → 1.0 — payload schemas + idempotency formulas (§3 already locks names and groupings).
 
-**Exit:** round-trip serialization tests green for all 16 events; schema locked.
+**Exit:** round-trip serialization tests green for all 18 events; schema locked.
 
 ### F2 — Outbox pattern
 
@@ -414,7 +414,7 @@ Ten things that unblock everything else. Not time-bound — but Phase 0 cannot s
 
 1. Land `/docs/platform-adr/` directory in `agi-os`. ADR-000 points at this design folder as authoritative.
 2. Draft ADR-001 Event envelope v2 in a branch, ready to PR on day 1.
-3. Open tracking issues for each of the 16 canonical events (8 task-lifecycle + 5 unit-lifecycle + 3 canvas-lifecycle). Link to `PLATFORM_DESIGN §10` + `EVENT_CATALOG.md §3`.
+3. Open tracking issues for each of the 18 canonical events (10 task-lifecycle + 5 unit-lifecycle + 3 canvas-lifecycle). Link to `PLATFORM_DESIGN §10` + `EVENT_CATALOG.md §3`.
 4. Add Redis to `docker-compose.dev.yml` (unused yet, ready for F3 and cache work in S2).
 5. Shape (don't land) the Alembic migration skeleton for `dos_ih_outbox` in `integration-hub/alembic/versions/`.
 6. Ping the `project-management` owner about the upcoming `ProjectIntegration` removal in A4. Get verbal alignment.

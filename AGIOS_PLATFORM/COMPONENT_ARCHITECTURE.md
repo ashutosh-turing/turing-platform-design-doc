@@ -126,8 +126,6 @@ For Integration Hub components only, an additional field — **Current state vs 
 | 4.5 | Audit Log | A | not-implemented |
 | 4.6 | Secrets & Key Management | A | partial |
 | 4.7 | Artifact / Data Plane | A | partial |
-| 4.8 | Gateway / API Edge | A | partial |
-| 4.9 | Notification Edge | A | not-implemented |
 | 5.1 | User Pool | B | planned |
 | 5.2 | Task Execution + State Machine | B | partial |
 | 5.3 | QC / Prism | B | partial |
@@ -140,6 +138,9 @@ For Integration Hub components only, an additional field — **Current state vs 
 | 5.10 | Dispute / Appeal | B | not-implemented |
 | 5.11 | Admin / Operator Console | B | partial |
 | 5.12 | Observability & SLOs | B | partial |
+| 5.13 | Canvas Template (PRD §13.1) | B | not-implemented |
+| 5.14 | Vetting (PRD §11.6) | B | not-implemented |
+| 5.15 | Task Marketplace (PRD §12.3) | first-party worker-shell view | not-implemented |
 
 ---
 
@@ -661,19 +662,6 @@ Operator actions (all audited):
 - Grant / revoke capability scopes
 - Update `entry_url` or `backend_url` (requires re-approval)
 
-##### Performance at scale
-
-The canvas directory is on the worker-shell hot path: every iframe load resolves `slug → canvas_id + entry_url + capability grants`. At 200K concurrent workers with one navigation per minute this is ~3.3K QPS. IH's Postgres read path is not the right tier for this.
-
-**Caching rules:**
-
-1. **Shell pod LRU** — in-memory cache keyed by `slug`, holds ~500 canvases, TTL 5 min. Sub-millisecond on hit.
-2. **Redis cache** — second level keyed by `slug`, TTL 5 min, shared across shell pods.
-3. **Invalidation via the bus** — IH emits `CanvasRegistered`, `CanvasPromoted`, `CanvasDeprecated`, `CanvasArchived`, `CanvasCredentialRotated`, `CanvasScopeChanged`. The worker shell subscribes and invalidates the matching `slug` entries on both tiers.
-4. **Capability grants** are cached on the same key. A `CanvasScopeChanged` event triggers re-fetch on next miss; existing session JWTs continue until expiry (max 15 min lag) because scope lives in the token claim.
-
-At this point IH's own Postgres sees only cache misses and invalidation-triggered refetches — bounded at tens of QPS regardless of worker count.
-
 #### 4.3.5 Platform-provider integrations
 
 External services the platform depends on. Examples: GCS (artifact storage), Keyhive (LLM key management, GDPVal-specific today), GCP Secret Manager, Salesforce (inbound data source for customer integrations), Jibble (time tracking for `hourly` pay).
@@ -871,149 +859,6 @@ Not applicable. Zone A, non-optional. Every event from every canvas lands here.
 
 ---
 
-### 4.8 Gateway / API Edge (Zone A)
-
-**Purpose.** The single HTTP entry point for every canvas call into the platform — capability RPCs (`capabilities.use`), auth handoff, event emit endpoints, admin APIs. Today's `delivery-orchestration` service. At 1M workers the gateway is a shared resource for tens of thousands of QPS; its hot-path discipline is the difference between linear-scale and a cliff.
-
-**Zone + status.** Zone A. `partial`. Gateway exists today; hot-path discipline needs to be explicit.
-
-#### Hot-path discipline (non-negotiable)
-
-1. **Strictly stateless.** No per-request DB reads. Project lookups, canvas lookups, and tenancy checks resolve through the token claim or through cached reference data (see §4.3.4 Performance at scale).
-2. **Auth is token-native.** The session JWT (§5.2 of `CANVAS_SDK.md`) carries `scope`, `canvas_id`, `project_id`, `worker_id`. Gateway trusts the token signature (JWKS cache) and never re-derives authorization from the DB on a hot-path call.
-3. **Audit writes are async.** Every capability invocation emits `CapabilityInvoked` to the outbox; the gateway returns without waiting for audit-log persistence. Audit Log service (§4.5) drains the outbox.
-4. **Connection pooling + circuit breakers.** One pool per downstream capability service, with a per-service circuit breaker. A slow capability does not take down the gateway.
-5. **Per-worker rate limiting.** Redis token bucket keyed by `worker_id`, enforced at the edge. Caps a runaway canvas at (e.g.) 50 req/s per worker. Rejection returns `429` with `Retry-After` and emits `RateLimitExceeded`.
-6. **No business logic.** The gateway routes, authenticates, and meters. Every other concern lives in a downstream service.
-
-#### Contract
-
-- Routing is by `capability` string and `method` name (for `capabilities.use`), or by explicit path (for event emit, admin).
-- Every request carries a `correlation_id` header; if absent, gateway generates one. All downstream services propagate it.
-- 4xx vs 5xx is strict: 4xx means canvas did something wrong (fix the caller), 5xx means platform did something wrong (page the platform oncall).
-
-#### Events emitted
-
-| Event | When |
-|---|---|
-| `CapabilityInvoked` | Every `capabilities.use` call (async, via outbox) |
-| `RateLimitExceeded` | Per-worker rate limit tripped |
-| `GatewayCircuitOpen` | A downstream capability circuit opened |
-
-#### Storage ownership
-
-None direct. Gateway reads the JWKS cache (populated from Identity) and the capability routing table (populated from IH + service registry).
-
-#### Failure modes
-
-| Failure | Response |
-|---|---|
-| Downstream capability slow | Circuit breaker opens; gateway returns `503` with `Retry-After`; `GatewayCircuitOpen` emitted |
-| Downstream capability down | Same as above plus alert; canvas handles per its own retry policy |
-| JWKS fetch fails | Gateway falls back to last-known good JWKS (TTL 1 h); new tokens rejected with `unauthorized` if JWKS is stale beyond TTL |
-| Per-worker flood | 429 + event; operator console surfaces flooding canvases |
-
-#### Owner + open decisions
-
-- **Owner.** AGI-OS platform team.
-- **Open decision.** Whether to keep `delivery-orchestration` as the single gateway or split admin/operator APIs onto a separate edge. Leaning single gateway with a path prefix (`/admin/*` vs `/canvas/*`) to keep ops simple.
-
----
-
-### 4.9 Notification Edge (Zone A)
-
-**Purpose.** Terminate worker-facing real-time connections (SSE today, WebSocket or FCM/APNS tomorrow), subscribe to the canonical event bus, fan out relevant events to connected workers, and provide a store-and-deliver buffer for disconnected workers. This is the tier that turns canonical events into "the annotator sees a new task appear without refreshing."
-
-**Zone + status.** Zone A. `not-implemented`. The Zone B §5.6 (Notification — internal) is the capability API canvases emit into; §4.9 is the tier that delivers to the worker. Two different concerns.
-
-#### Why this is its own tier
-
-At 200K concurrent workers a single pod holds ~25K SSE connections before GC pressure kicks in. Notification edge is fundamentally stateful (one long-lived socket per worker) and must be deployed separately from the stateless `worker-experience-service`. Co-locating them means the stateless chrome API tier inherits the stateful pod lifecycle (sticky routing, drain-on-deploy) for no reason.
-
-#### Topology
-
-```mermaid
-flowchart LR
-    W1[Worker 1] -.SSE.-> NE1[notification-edge pod 1]
-    W2[Worker 2] -.SSE.-> NE1
-    W3[Worker 3] -.SSE.-> NE2[notification-edge pod 2]
-    WN[Worker N] -.SSE.-> NEM[notification-edge pod M]
-
-    LB[LB<br/>hash worker_id] --> NE1
-    LB --> NE2
-    LB --> NEM
-
-    BUS[[Redis Streams<br/>hot bus]] --> NE1
-    BUS --> NE2
-    BUS --> NEM
-
-    NE1 --> PG[(Postgres<br/>store-and-deliver<br/>dos_ne_pending)]
-    NE2 --> PG
-    NEM --> PG
-
-    FCM[FCM / APNS<br/>mobile / idle workers]
-    NE1 -.fallback.-> FCM
-```
-
-- Sticky routing via LB hash on `worker_id` so reconnects land on the pod that already holds the subscription state.
-- Each pod subscribes to the hot bus with a consumer-group filter; in-memory map `worker_id → [topic filters]` decides which events forward to which socket.
-- Pods are stateless with respect to storage — presence is derived from the socket list; disconnection triggers a store-to-Postgres write (unread queue, bounded).
-- Mobile / idle workers (no open socket for > 5 min) fall back to FCM/APNS push.
-
-#### Contract
-
-1. Once a canvas emits into the Notification (Zone B) capability, delivery to online workers is **at-least-once within 2 s p99**.
-2. Offline delivery is **at-least-once within 24 h**; unread queue is bounded at 1000 entries per worker (oldest dropped with `NotificationQueueOverflow` event).
-3. Reconnection drains the unread queue before resuming live stream. Client acks each delivery.
-4. Multi-device: one worker can have multiple active sockets (e.g. two browser tabs); fan-out to all.
-
-#### Events emitted
-
-| Event | When |
-|---|---|
-| `NotificationDelivered` | Push acked by client |
-| `NotificationQueuedForOffline` | Worker disconnected; message went to the unread queue |
-| `NotificationQueueOverflow` | Unread queue for a worker exceeded 1000; oldest dropped |
-
-#### Events consumed
-
-Anything the notification-emitting capability (§5.6) routes to it. Routing rules are per-topic and per-subscription; canvases subscribe workers to topics at task-claim time.
-
-#### Storage ownership
-
-- `dos_ne_pending (worker_id, notification_id, payload, enqueued_at, expires_at)` — unread queue. TTL-based cleanup.
-- `dos_ne_subscriptions (worker_id, canvas_id, topic, expires_at)` — per-worker topic filters. Populated by capability calls.
-
-Redis for presence (`ne:presence:<worker_id>` with socket-pod mapping); Postgres for the durable queue.
-
-#### Scale envelope
-
-| Metric | Target |
-|---|---|
-| Concurrent sockets per pod | 25K (measured ceiling; revisit if frameworks change) |
-| End-to-end latency bus → client p99 | 2 s |
-| Fan-out throughput per pod | 5K msgs/s |
-| Unread queue write rate | 10K/s sustained |
-
-200K concurrent → 8 pods steady-state, provision 12 for headroom. 1M concurrent → 40 pods, provision 60.
-
-#### Failure modes
-
-| Failure | Response |
-|---|---|
-| Pod crash | Clients reconnect; LB hashes to the same pod type; unread queue in Postgres catches anything missed |
-| Hot bus lag | Notification delivery lags proportionally; surfaced via dashboard; no data loss |
-| Client flapping (reconnect storm) | Exponential backoff client-side + per-worker connection-rate cap at the LB |
-| Worker muted (> 24 h) | Queue TTL expires; older notifications dropped; emitter can query unread count via API |
-
-#### Owner + open decisions
-
-- **Owner.** AGI-OS platform team (new service).
-- **Open decision.** SSE vs WebSocket for v1. Leaning SSE — one-way, simpler, works with HTTP/2 multiplexing, no framing overhead for our use case. WebSocket opens up bi-directional but we don't need it in v1.
-- **Open decision.** Whether to build our own edge or put Cloud Pub/Sub + an off-the-shelf push service in front. Leaning build-our-own because the subscription-filter logic is canvas-specific and wedding it to a generic push provider adds indirection with no benefit. Revisit if ops load shows otherwise.
-
----
-
 ## 5. Zone B components
 
 ### 5.1 User Pool (Zone B)
@@ -1123,11 +968,18 @@ Postgres chosen for `SELECT FOR UPDATE SKIP LOCKED` semantics and strong consist
 | Interface | Purpose | Stock implementations |
 |---|---|---|
 | `ClaimStrategy` | Decide which unit a claiming worker gets next | `FIFO`, `SkillMatch`, `TieredTTL`, `WeightedRandom` |
-| `EligibilityPolicy` | Decide whether a worker may claim a given unit | `PermissiveDefault`, `SkillFloor`, `ClientWhitelist`, `WatchedUserThrottle` |
+| `EligibilityPolicy` | Decide whether a worker may claim a given unit | `PermissiveDefault`, `SkillFloor`, `ClientWhitelist`, `WatchedUserThrottle`, `ConcurrentClaimLimit`, `VettingRequired` |
 | `TTLPolicy` | Compute initial and extended TTL | `Static`, `Sliding`, `DifficultyScaled` |
 | `ClaimMode` | Exclusive or shared-quota claim | `Exclusive`, `SharedQuota` |
 
-Canvases at Level 1 declare one or more of these overrides in their manifest. Stock strategies ship in `agi_os.user_pool.strategies`; custom implementations live in the canvas's codebase and register by name.
+Canvases at Level 1 declare one or more of these overrides via IH registration. Stock strategies ship in `agi_os.user_pool.strategies`; custom implementations live in the canvas's codebase and register by name.
+
+**Stock `EligibilityPolicy` details** (PRD §11.3.1 + §11.6 alignment):
+
+- **`ConcurrentClaimLimit`** — enforces PRD's per-tier ceiling on simultaneously held units. Worker tier derives from lifetime stats (acceptance rate, completed count); default ladder is `New=3 / Established=7 / Expert=15` (configurable per canvas). Implementation: at claim time, `SELECT count(*) FROM dos_up_claims WHERE worker_id=? AND status='active'` and reject with `429 ConcurrentLimitReached` if `>= limit`. Cheap index hit on a `(worker_id, status)` covering index.
+- **`VettingRequired`** — reads `worker.vetting_status[canvas_id]` (from §5.14) and rejects claim if `!= passed`. No-op if the canvas hasn't opted into vetting.
+
+Eligibility policies are **composable** — a pool can declare multiple and all must pass. Order matters for debuggability (cheap filters first); the framework enforces it.
 
 #### Adoption levels
 
@@ -1144,38 +996,10 @@ Canvases at Level 1 declare one or more of these overrides in their manifest. St
 | Pool exhaustion | Canvas's `TaskCreated` rate exceeds pool throughput; SDK surfaces a queue-depth warning via metrics; ops dashboards red on sustained depth |
 | Worker fraud (claim-and-drop cycle) | `WatchedUserThrottle` caps rapid release cycles per worker; audit events emitted; ops alert |
 
-#### Scale / hot-path discipline
-
-The reference implementation is the one every Level-0 canvas inherits. It must hold at 1M registered workers / 200K concurrent without forcing canvases up to Level 2. Two call volumes dominate:
-
-- **Claim.** ~330 QPS sustained, ~2.5K QPS at shift start.
-- **Heartbeat.** ~6.7K QPS steady (30 s cadence × 200K concurrent).
-
-Postgres `SKIP LOCKED` handles the claim rate comfortably when `dos_up_units` is partitioned by `pool_id` and indexed on `(status, eligibility_hash, claim_strategy_key)`. Heartbeats, however, would saturate Postgres — they must not touch it.
-
-**Hot-path rules:**
-
-1. **Claim path** — Postgres `SELECT … FOR UPDATE SKIP LOCKED` on a pool-sharded table. Write-through to a Redis claim record (`claim:<claim_id>` with TTL = lease duration) for the heartbeat path to refresh.
-2. **Heartbeat path** — Redis `EXPIRE claim:<claim_id> <new_ttl>`. Zero Postgres touch. A background reconciler drains expired Redis keys into `UnitExpired` events and flushes lease state back to Postgres.
-3. **Release / complete** — Dual-write: Redis delete + Postgres state update in the same service call, Redis first. A lost Postgres write is recovered by the reconciler using the Redis-absence signal.
-4. **Pool shard fan-out** — Large pools (> 100K posted units) shard by a configurable bucket key: `pool:<pool_id>:shard:{0..31}`. Dispatcher rotates workers across shards to avoid hot-key contention. Default bucket count is 16; tune per-pool.
-5. **Eligibility check** — Evaluated inside the claim query via a materialized `eligibility_hash` column; complex policies are resolved async on unit post, not on claim. Claim-time eligibility is always a hash comparison.
-
-**Committed SLOs (reference implementation, Level 0):**
-
-| Operation | p50 | p99 | Sustained throughput |
-|---|---|---|---|
-| `claim` | 20 ms | 100 ms | 10K QPS |
-| `heartbeat` | 2 ms | 10 ms | 50K QPS |
-| `release` / `complete` | 15 ms | 80 ms | 5K QPS |
-
-These are the numbers Level-0 canvases can plan around. A canvas that needs more throughput than this for a single pool should shard its pool; a canvas that needs different claim semantics moves to Level 2.
-
 #### Owner + open decisions
 
 - **Owner.** AGI-OS platform team.
 - **Open decision.** Default `ClaimMode` is `Exclusive`. Shared-quota is opt-in per pool. Confirm with first two canvases (TB, GDPVal) that this matches their expectation before locking the default.
-- **Open decision.** Pool-shard default bucket count. 16 feels right for pools up to ~500K units; revisit if OpenClaw or xAI routing pushes higher.
 
 ---
 
@@ -1276,6 +1100,60 @@ These are the numbers Level-0 canvases can plan around. A canvas that needs more
 ### 5.12 Observability & SLOs (Zone B)
 
 > **Stub.** Dashboards, metrics, alerting. Canonical events → warehouse → SLO definitions per component.
+
+---
+
+### 5.13 Canvas Template (Zone B)
+
+> **Stub. PRD §13.1 alignment.**
+>
+> **Purpose.** A single, containerized, configurable **reference canvas** that new projects clone and configure rather than build from scratch. Ships task-type schema, UI slot definitions, workflow stage wiring, validation hooks, bridge-SDK integration, and bootstrap code for IH registration + session handoff — all pre-wired to the platform. Opinionated defaults; not mandatory. A canvas team that needs something fundamentally different builds their own (Zone C stays Zone C); a canvas team that fits the template ships in days instead of months.
+>
+> **Zone + status.** Zone B. `not-implemented`.
+>
+> **Target.** Published as `canvas-starter/` in the monorepo (or as a separate repo `canvas-starter`). Consumers of the template receive: (a) a Dockerfile that runs, (b) a `canvas.config.yaml` for project-level overrides (task types, instructions URL, review model, rate card reference), (c) prewired `@agi-os/canvas-sdk` bridge, (d) a working React app scaffold with default Instructions/Workspace/Submission UI zones, (e) example emitters for `TaskCreated` + `TaskSubmitted`. OpenClaw (our canary) is the first user of this template and de facto its functional test.
+>
+> **Anti-goal.** Template is **not** a runtime dependency. A forked template and its parent must diverge independently; there's no "update template → all canvases update" contract. Template is a starting point, not a framework.
+
+---
+
+### 5.14 Vetting (Zone B)
+
+> **Stub. PRD §11.6, §12.2 alignment.**
+>
+> **Purpose.** Gates a worker's production access to a canvas. Configured per-project as a sequence of steps — quizzes, task trials against golden datasets, mandatory session acknowledgements, sample-task pass rate. On pass, `worker.vetting_status[canvas_id] = passed`; on fail, worker is blocked from claiming production units for that canvas until remediation or retry policy allows.
+>
+> **Zone + status.** Zone B. `not-implemented`.
+>
+> **Contract.**
+> - Canvases define vetting requirements via IH admin console (`quizzes`, `golden_dataset_refs`, `required_sessions`, `pass_threshold`).
+> - Worker-shell first-party view (`canvas-agi-os.turing.com/<slug>/vetting`) runs the flow; vetting service is the backend.
+> - On outcome, emits `WorkerVetted` (payload: `worker_id`, `canvas_id`, `outcome`, `score`, `vetted_at`) — **deferred to a catalog minor bump** (v1 is 18 events; this lands when §5.14 ships).
+> - User Pool eligibility filter reads `worker.vetting_status[canvas_id]` alongside skill/domain/concurrent-limit rules.
+>
+> **Why Zone B (not canvas-owned).** PRD §7 principle: "centralized in structure, flexible in execution." Canvases configure content; platform owns the pipeline, audit, and gating contract. A canvas that needs exotic vetting (e.g. GDPVal-style expert calibration) graduates to Level 2 and replaces the implementation while keeping the eligibility contract.
+>
+> **Explicit scope fence for v1.** Not shipping with the OpenClaw canary. First real adopter is whichever canvas next onboards after OpenClaw stabilizes. Documented now so the User Pool eligibility interface doesn't need reshaping when vetting lands.
+
+---
+
+### 5.15 Task Marketplace (first-party worker-shell view)
+
+> **Stub. PRD §12.3 alignment.**
+>
+> **Purpose.** The trainer entry screen — a browsable, filterable list of tasks the worker is eligible to claim across all canvases they have access to. **Not a canvas.** This is a first-party view hosted by the worker shell (`canvas-agi-os.turing.com/tasks`) that reads from the platform directly and routes claims to the appropriate canvas's pool.
+>
+> **Zone + status.** First-party worker-shell view (see `CANVAS_SDK.md §2.6`). `not-implemented`.
+>
+> **Contract.**
+> - Backed by `worker-experience-service` (Stream 2, S2). Exposes `GET /marketplace?filters=...` returning eligible units across all canvases the worker has grants for.
+> - Filter shape: task type, complexity tier, payout range, estimated time, keyword.
+> - Claim action calls `user-pool` via a canvas-scoped token minted at claim time (shell does the handoff).
+> - Subscribes to the hot bus (`UnitPosted`, `UnitClaimed`, `UnitExpired`) via Notification Edge to refresh live without polling.
+>
+> **Why a first-party view, not each canvas's problem.** Workers who span multiple canvases (common case for experienced trainers) should see a single marketplace. If each canvas built its own, the worker's life becomes 12 tabs. PRD §7.2 ("central shell, flexible task pane") is explicit.
+>
+> **Scope boundary.** Marketplace shows tasks. It does **not** execute tasks — clicking a task hands off to the canvas iframe. The marketplace is pure discovery + claim; all execution is canvas-owned.
 
 ---
 

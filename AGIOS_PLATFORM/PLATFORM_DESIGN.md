@@ -641,9 +641,9 @@ Worth being explicit because architects tend to drift:
 
 ## 10. Canonical event catalog v1
 
-The envelope is frozen (11 fields — see `EVENT_CATALOG.md §2`). The v1 event list is **16 events in three groups**. Payload schemas, idempotency formulas, and full examples live in `EVENT_CATALOG.md`; this section pins the names and groupings so the rest of this document can reference them.
+The envelope is frozen (11 fields — see `EVENT_CATALOG.md §2`). The v1 event list is **18 events in three groups**. Payload schemas, idempotency formulas, and full examples live in `EVENT_CATALOG.md`; this section pins the names and groupings so the rest of this document can reference them.
 
-### 10.1 Task lifecycle (8 events)
+### 10.1 Task lifecycle (10 events)
 
 The customer contract: a billable task moving through the platform. These events track the canonical state machine in `§11`. Applies to every canvas regardless of billing model.
 
@@ -654,7 +654,9 @@ The customer contract: a billable task moving through the platform. These events
 | `TaskValidated` | QC / Prism | `Submitted → Validated` |
 | `TaskReworked` | QC / Prism | `Validated → Reworked` |
 | `TaskRejected` | QC / Prism | `Validated → Rejected` |
-| `TaskAccepted` | QC / Prism | `Validated → Accepted` |
+| `TaskEscalated` | QC / Prism or canvas | `Reworked → Escalated` (max rework), `Validated → Escalated` (integrity), `Rejected → Escalated` (appeal) |
+| `TaskAccepted` | QC / Prism or senior-qa | `Validated → Accepted` or `Escalated → Accepted` |
+| `TaskPermanentlyRejected` | senior-qa | `Escalated → PermanentlyRejected` |
 | `TaskDelivered` | canvas | `Accepted → Delivered` |
 | `TaskDeliveryAcked` | integration-hub | `Delivered → DeliveryAcked` |
 
@@ -705,11 +707,17 @@ stateDiagram-v2
     Validated --> Accepted: QC emits TaskAccepted
     Validated --> Reworked: QC emits TaskReworked
     Validated --> Rejected: QC emits TaskRejected
-    Reworked --> Claimed: unit re-posted
+    Validated --> Escalated: QC emits TaskEscalated (integrity flag)
+    Reworked --> Claimed: unit re-posted (attempt++)
+    Reworked --> Escalated: QC emits TaskEscalated (max attempts exhausted)
+    Rejected --> Escalated: canvas emits TaskEscalated (contractor appeal)
+    Escalated --> Accepted: senior-qa emits TaskAccepted
+    Escalated --> PermanentlyRejected: senior-qa emits TaskPermanentlyRejected
     Accepted --> Delivered: canvas emits TaskDelivered
     Delivered --> DeliveryAcked: IH Outbound emits TaskDeliveryAcked
     Claimed --> Created: UnitExpired (TTL)
-    Rejected --> [*]
+    Rejected --> [*]: appeal window closed
+    PermanentlyRejected --> [*]
     DeliveryAcked --> [*]
 ```
 
@@ -720,16 +728,24 @@ stateDiagram-v2
 | `Created` | Task exists and is posted to a pool, awaiting a worker |
 | `Claimed` | A worker has a lease; TTL is counting down |
 | `Submitted` | Worker submitted an artifact; awaiting QC |
-| `Validated` | QC has processed; one of `Accepted` / `Reworked` / `Rejected` follows |
+| `Validated` | QC has processed; one of `Accepted` / `Reworked` / `Rejected` / `Escalated` follows |
 | `Accepted` | QC passed; task is ready to deliver to customer |
-| `Reworked` | QC failed but recoverable; task re-enters pool |
-| `Rejected` | QC failed terminally; task is closed, not paid, not delivered |
+| `Reworked` | QC failed but recoverable; task re-enters the pool for the same worker (1:1) up to `max_rework_attempts` |
+| `Rejected` | QC failed with fast-path reject; appeal window open. Terminal if the window closes without appeal |
+| `Escalated` | Under Senior QA review — either from max-rework exhaustion, an integrity flag, or a contractor appeal |
+| `PermanentlyRejected` | Senior QA final reject; no payout, closed |
 | `Delivered` | Canvas emitted `TaskDelivered`; IH Outbound has been triggered |
 | `DeliveryAcked` | Customer acked the outbound delivery; loop closed |
 
+**Three escalation triggers** (PRD §11.8.1 alignment):
+
+1. **Max rework attempts exhausted** — `Reworked → Escalated`, emitted by QC when `rework_attempt_number > max_rework_attempts`.
+2. **Integrity concern** — `Validated → Escalated`, emitted by QC when a reviewer flags potential fraud, prohibited tool use, or policy breach.
+3. **Contractor appeal** — `Rejected → Escalated`, emitted by the canvas (or shell's appeal UI) when a worker contests a reject inside the appeal window.
+
 **Canvas-side mapping.** A canvas with richer internal states (e.g. TB's 6 substates between `Submitted` and `Validated`) maps them to canonical states at emission time. The canvas's internal state machine is Zone C; the canonical one is Zone A.
 
-**Transitions not shown** (for legibility): `Cancelled` from any pre-`Delivered` state (customer withdrew), `PayableEventVoided` for reversals.
+**Transitions not shown** (for legibility): `Cancelled` from any pre-`Delivered` state (customer withdrew), `PayableEventVoided` for reversals, `Paused` (admin temporarily hides the task from the pool).
 
 ---
 

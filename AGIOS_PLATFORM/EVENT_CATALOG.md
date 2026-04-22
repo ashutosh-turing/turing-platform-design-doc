@@ -40,11 +40,11 @@ Every `DomainEvent` on the bus carries this envelope. The envelope is **immutabl
 
 ## 3. Event catalog v1
 
-**16 events in three groups.** Names and groupings are frozen. Payload schemas + idempotency formulas are Phase F1 deliverables (Pass 3 content).
+**18 events in three groups.** Names and groupings are frozen. Payload schemas + idempotency formulas are Phase F1 deliverables (Pass 3 content).
 
-### 3.1 Task lifecycle (8 events)
+### 3.1 Task lifecycle (10 events)
 
-The customer contract — a billable task traversing the canonical state machine (`PLATFORM_DESIGN §11`). Applies to every canvas regardless of billing model.
+The customer contract — a billable task traversing the canonical state machine (`PLATFORM_DESIGN §11`). Applies to every canvas regardless of billing model. The `<attempt>` in idempotency keys is the rework-attempt index (`0` for first submission, `1` for first rework, etc.) so QC can re-emit safely.
 
 | Event | Emitter | Stage | State transition | Idempotency key (preview) |
 |---|---|---|---|---|
@@ -53,9 +53,17 @@ The customer contract — a billable task traversing the canonical state machine
 | `TaskValidated` | qc / prism | qc | `Submitted → Validated` | `task_id:<attempt>:validated` |
 | `TaskReworked` | qc / prism | qc | `Validated → Reworked` | `task_id:<attempt>:reworked` |
 | `TaskRejected` | qc / prism | qc | `Validated → Rejected` | `task_id:<attempt>:rejected` |
-| `TaskAccepted` | qc / prism | qc | `Validated → Accepted` | `task_id:<attempt>:accepted` |
+| `TaskEscalated` | qc / prism or canvas | qc / appeal | `Reworked → Escalated` (max rework), `Validated → Escalated` (integrity), `Rejected → Escalated` (appeal) | `task_id:escalated:<reason>` where `reason` ∈ `max_rework` / `integrity` / `appeal` |
+| `TaskAccepted` | qc / prism or senior-qa | qc / escalation | `Validated → Accepted` or `Escalated → Accepted` | `task_id:<attempt>:accepted` |
+| `TaskPermanentlyRejected` | senior-qa | escalation | `Escalated → PermanentlyRejected` | `task_id:permanently_rejected` |
 | `TaskDelivered` | canvas | deliver | `Accepted → Delivered` | `task_id:delivered` |
 | `TaskDeliveryAcked` | integration-hub | deliver | `Delivered → DeliveryAcked` | `task_id:delivery_acked` |
+
+**Payload notes for escalation-relevant events** (locked during F1):
+
+- `TaskReworked.payload` must include `rework_attempt_number` (1-indexed) so billing can compute rework penalties (PRD rate-modifier table: `-20%` on 1st rework, `-50%` on 2nd).
+- `TaskEscalated.payload` must include `escalation_reason` (`max_rework` / `integrity` / `appeal`), `prior_attempts` count, and `triggering_event_id`.
+- `TaskPermanentlyRejected.payload` must include `senior_reviewer_id`, `rejection_reason_code`, and the full `escalation_chain` (ordered list of prior `event_id`s).
 
 ### 3.2 Unit lifecycle (5 events, pay-per-task-specific)
 
@@ -109,4 +117,4 @@ Existing event types in `services/shared/shared/events/types.py`:
 - `QAReviewCompleted`, `SignOffApproved`
 - `WebhookReceived`, `ConnectorInvoked`
 
-**Gap.** These cover project lifecycle and integration mechanics but do not cover the canonical task/unit/canvas lifecycles (`§3.1` – `§3.3`). The v1 catalog adds all 16 events, plus upgrades the envelope to carry `project_id`, `idempotency_key`, `schema_version`, `correlation_id`, `causation_id`, and `canvas_id` — none of which today's `DomainEvent` base class has. See `KICKOFF.md §5 F1` for the implementation plan.
+**Gap.** These cover project lifecycle and integration mechanics but do not cover the canonical task/unit/canvas lifecycles (`§3.1` – `§3.3`). The v1 catalog adds all 18 events, plus upgrades the envelope to carry `project_id`, `idempotency_key`, `schema_version`, `correlation_id`, `causation_id`, and `canvas_id` — none of which today's `DomainEvent` base class has. See `KICKOFF.md §5 F1` for the implementation plan.
